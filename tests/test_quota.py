@@ -397,3 +397,50 @@ async def test_multiple_quota_hits_then_recovery(
     assert system_coordinator_mock._quota_exc_info is None
 
     await mocked_api.aiohttp_session.close()
+
+
+async def test_http_429_is_treated_as_rate_limit():
+    """Every HTTP 429 response must activate quota/rate-limit handling."""
+    from custom_components.mypyllant.utils import is_quota_exceeded_exception
+
+    exc = ClientResponseError(
+        request_info=RequestInfo(
+            url="https://api.vaillant-group.com/service-connected-control/end-user-app-api/v1/homes",  # type: ignore
+            method="GET",
+            headers=None,  # type: ignore
+        ),
+        history=None,  # type: ignore
+        status=429,
+        message='{ "statusCode": 429, "message": "Rate limit is exceeded. Try again in 42 seconds." }',
+    )
+    assert is_quota_exceeded_exception(exc)
+
+
+async def test_rate_limit_duration_from_try_again_seconds():
+    """Parse Vaillant's short-term HTTP 429 retry message."""
+    exc = ClientResponseError(
+        request_info=RequestInfo(
+            url="https://api.vaillant-group.com/service-connected-control/end-user-app-api/v1/homes",  # type: ignore
+            method="GET",
+            headers=None,  # type: ignore
+        ),
+        history=None,  # type: ignore
+        status=429,
+        message='{ "statusCode": 429, "message": "Rate limit is exceeded. Try again in 42 seconds." }',
+    )
+    assert extract_quota_duration(exc) == 42
+
+
+async def test_rate_limit_duration_from_try_again_minutes():
+    """Also accept minute-based retry messages if Vaillant returns them."""
+    exc = ClientResponseError(
+        request_info=RequestInfo(
+            url="https://api.vaillant-group.com/service-connected-control/end-user-app-api/v1/homes",  # type: ignore
+            method="GET",
+            headers=None,  # type: ignore
+        ),
+        history=None,  # type: ignore
+        status=429,
+        message="Rate limit is exceeded. Try again in 2 minutes.",
+    )
+    assert extract_quota_duration(exc) == 120

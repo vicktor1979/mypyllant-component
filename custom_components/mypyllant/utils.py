@@ -217,16 +217,24 @@ def shorten_zone_name(zone_name: str) -> str:
 
 
 def is_quota_exceeded_exception(exc_info: BaseException | None) -> bool:
+    """Return True for Vaillant quota/rate-limit HTTP responses.
+
+    Vaillant currently uses more than one response form for throttling.
+    Besides the older 403 quota messages, short-term throttling may be
+    returned as HTTP 429 with text such as "Rate limit is exceeded."
+    Treat every 429 response as a rate-limit response regardless of wording.
     """
-    Returns True if the exception is a quota exceeded ClientResponseError
-    """
-    return (
-        isinstance(exc_info, ClientResponseError)
-        and 500 > exc_info.status >= 400
-        and (
-            "quota exceeded" in exc_info.message.lower()
-            or "out of call volume quota" in exc_info.message.lower()
-        )
+    if not isinstance(exc_info, ClientResponseError):
+        return False
+
+    if exc_info.status == 429:
+        return True
+
+    message = (exc_info.message or "").lower()
+    return 500 > exc_info.status >= 400 and (
+        "quota exceeded" in message
+        or "out of call volume quota" in message
+        or "rate limit is exceeded" in message
     )
 
 
@@ -271,13 +279,32 @@ def extract_quota_duration(exc_info: BaseException | None) -> int | None:
     import re
 
     match = re.search(
-        r"Quota will be replenished in (\d{2}):(\d{2}):(\d{2})", exc_info.message
+        r"Quota will be replenished in (\d{2}):(\d{2}):(\d{2})",
+        exc_info.message,
+        flags=re.IGNORECASE,
     )
     if match:
         hours = int(match.group(1))
         minutes = int(match.group(2))
         seconds = int(match.group(3))
         return hours * 3600 + minutes * 60 + seconds
+
+    # Short-term Vaillant throttling currently also uses messages like:
+    # "Rate limit is exceeded. Try again in 42 seconds."
+    match = re.search(
+        r"try again in\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours)\b",
+        exc_info.message,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit.startswith("hour"):
+            return amount * 3600
+        if unit.startswith("minute"):
+            return amount * 60
+        return amount
+
     return None
 
 

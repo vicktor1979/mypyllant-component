@@ -307,6 +307,10 @@ class SystemCoordinator(MyPyllantCoordinator):
         # attribute, which can leak state between config entries.
         self.homes: list[Home] = []
         self.homes_last_refresh: str | None = None
+        # True only when the account itself has no homes/gateways.  This is a
+        # valid myVAILLANT account state (for example after all systems were
+        # removed) and must not trigger an endless setup retry loop.
+        self.empty_account = False
         self.system_failures: dict[str, SystemUpdateFailure] = {}
         self.system_last_success: dict[str, str] = {}
 
@@ -396,7 +400,30 @@ class SystemCoordinator(MyPyllantCoordinator):
             ]
             self.homes_last_refresh = dt.now(timezone.utc).isoformat()
             if not self.homes:
-                raise UpdateFailed("No myVAILLANT homes returned by the API")
+                # A successful /homes response with an empty list is a valid
+                # account state.  This can happen after all systems/gateways
+                # have been removed from an account.  On initial setup, treat
+                # it as a successful empty integration instead of asking Home
+                # Assistant to retry forever (which itself can trigger 429s).
+                #
+                # If an already-populated coordinator suddenly receives an
+                # empty list, keep the old data and fail this single refresh:
+                # that is safer than deleting all live entities on a possibly
+                # transient/partial API response.
+                if self.data:
+                    self.empty_account = False
+                    raise UpdateFailed(
+                        "myVAILLANT returned no homes for a previously populated account"
+                    )
+                self.empty_account = True
+                self.system_failures = {}
+                self.system_last_success = {}
+                _LOGGER.info(
+                    "myVAILLANT account %s has no homes; treating it as a valid empty account",
+                    self.api.username,
+                )
+                return []
+            self.empty_account = False
         except ClientResponseError as e:
             await self._set_quota_and_raise(e)
             raise UpdateFailed(str(e)) from e
@@ -571,6 +598,16 @@ class DailyDataCoordinator(MyPyllantCoordinator):
         return False
 
     async def _async_update_data(self) -> dict[str, SystemWithDeviceData]:
+        # A confirmed empty account has no daily data to fetch.  Return locally
+        # before token refresh/API access so an unused account cannot consume
+        # quota merely because Home Assistant reloads or refreshes it.
+        system_coordinator: SystemCoordinator | None = self.hass_data.get(
+            "system_coordinator"
+        )
+        if system_coordinator is not None and system_coordinator.empty_account:
+            _LOGGER.debug("Empty myVAILLANT account, skipping daily data API fetch")
+            return {}
+
         await self._raise_if_persistent_quota_hit()
         self._raise_if_quota_hit()
         _LOGGER.debug("Starting async update data for DailyDataCoordinator")
@@ -583,13 +620,8 @@ class DailyDataCoordinator(MyPyllantCoordinator):
             self._raise_api_down(e)
             return {}  # mypy
 
-        if (
-            "system_coordinator" not in self.hass_data
-            or not self.hass_data["system_coordinator"].data
-        ):
+        if system_coordinator is None or not system_coordinator.data:
             raise UpdateFailed("No systems available for daily data fetch")
-
-        system_coordinator: SystemCoordinator = self.hass_data["system_coordinator"]
         previous_data = self.data or {}
         previous_failures = self.system_failures
         current_failures: dict[str, SystemUpdateFailure] = {}

@@ -159,16 +159,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise
     hass.data[DOMAIN][entry.entry_id]["system_coordinator"] = system_coordinator
 
-    # Daily data coordinator is fetched once by default (to get all entities), but not updated on a regular basis
-    # to prevent quota errors
-    daily_data_coordinator = DailyDataCoordinator(
-        hass,
-        api,
-        entry,
-        timedelta(seconds=update_interval_daily) if update_interval_daily else None,
-    )
-    _LOGGER.debug("Refreshing DailyDataCoordinator")
-    await daily_data_coordinator.async_refresh()
+    # Daily data coordinator is fetched once by default (to get all entities), but
+    # not updated on a regular basis
+    # to prevent quota errors.  A successfully authenticated account with no
+    # homes is valid; do not make any more API calls for it after the initial
+    # /homes check.  With no entities there are no coordinator listeners, and
+    # explicitly disabling the interval also prevents accidental future polls.
+    if system_coordinator.empty_account:
+        _LOGGER.info(
+            "myVAILLANT account %s contains no homes; disabling polling until "
+            "the config entry is reloaded",
+            username,
+        )
+        system_coordinator.update_interval = None
+        daily_data_coordinator = DailyDataCoordinator(hass, api, entry, None)
+        daily_data_coordinator.async_set_updated_data({})
+    else:
+        daily_data_coordinator = DailyDataCoordinator(
+            hass,
+            api,
+            entry,
+            timedelta(seconds=update_interval_daily) if update_interval_daily else None,
+        )
+        _LOGGER.debug("Refreshing DailyDataCoordinator")
+        await daily_data_coordinator.async_refresh()
     hass.data[DOMAIN][entry.entry_id]["daily_data_coordinator"] = daily_data_coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

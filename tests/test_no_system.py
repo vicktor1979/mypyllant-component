@@ -11,6 +11,7 @@ without worrying about silently masking real failures.
 """
 
 import pytest
+from unittest import mock
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from myPyllant.api import MyPyllantAPI
@@ -50,4 +51,45 @@ async def test_daily_data_coordinator_fails_without_systems(
         assert system_coordinator.data == []
         with pytest.raises(UpdateFailed):
             await daily_data_coordinator_mock._async_update_data()
+    await mocked_api.aiohttp_session.close()
+
+
+async def test_empty_account_is_valid_and_does_not_retry(
+    mocked_api: MyPyllantAPI,
+    system_coordinator_mock,
+):
+    """A successful empty /homes response is a valid account state."""
+
+    async def empty_homes():
+        if False:  # pragma: no cover - keep this an async generator
+            yield None
+
+    system_coordinator_mock._refresh_session = mock.AsyncMock()
+    system_coordinator_mock.api.get_homes = mock.Mock(return_value=empty_homes())
+
+    data = await system_coordinator_mock._async_update_data()
+
+    assert data == []
+    assert system_coordinator_mock.empty_account is True
+    assert system_coordinator_mock.system_failures == {}
+    assert system_coordinator_mock.system_last_success == {}
+
+    await mocked_api.aiohttp_session.close()
+
+
+async def test_daily_data_skips_api_for_empty_account(
+    mocked_api: MyPyllantAPI,
+    daily_data_coordinator_mock,
+):
+    """An empty account must not spend API quota on daily-data refreshes."""
+    system_coordinator = daily_data_coordinator_mock.hass_data["system_coordinator"]
+    system_coordinator.empty_account = True
+    system_coordinator.data = []
+    daily_data_coordinator_mock._refresh_session = mock.AsyncMock()
+
+    data = await daily_data_coordinator_mock._async_update_data()
+
+    assert data == {}
+    daily_data_coordinator_mock._refresh_session.assert_not_awaited()
+
     await mocked_api.aiohttp_session.close()
