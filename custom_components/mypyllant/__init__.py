@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+
+from aiohttp import ClientError
 from datetime import datetime as dt, timedelta
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
@@ -11,7 +13,7 @@ from homeassistant.core import (
     ServiceCall,
     ServiceResponse,
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import selector
 
 from myPyllant import export, report
@@ -107,13 +109,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await api.login()
     except (AuthenticationFailed, LoginEndpointInvalid, RealmInvalid) as e:
+        await api.aiohttp_session.close()
         raise ConfigEntryAuthFailed from e
+    except (ClientError, TimeoutError, OSError) as e:
+        # Treat temporary login/network failures as a setup retry instead of a
+        # permanent failed setup.  This is especially important when several
+        # myVAILLANT config entries start at the same time after a HA restart.
+        await api.aiohttp_session.close()
+        raise ConfigEntryNotReady(
+            f"Temporary myVAILLANT login/network error: {e}"
+        ) from e
 
     system_coordinator = SystemCoordinator(
         hass, api, entry, timedelta(seconds=update_interval)
     )
     _LOGGER.debug("Refreshing SystemCoordinator")
-    await system_coordinator.async_refresh()
+    try:
+        # async_refresh() only records a failed first refresh and then setup
+        # continues, which can leave entity-registry entries as "not
+        # provided" until the user manually reloads the config entry.  The
+        # config-entry first-refresh helper raises ConfigEntryNotReady on a
+        # complete initial fetch failure, so Home Assistant retries setup
+        # automatically once the Vaillant API/gateway recovers.
+        await system_coordinator.async_config_entry_first_refresh()
+    except ConfigEntryNotReady:
+        await api.aiohttp_session.close()
+        raise
     hass.data[DOMAIN][entry.entry_id]["system_coordinator"] = system_coordinator
 
     # Daily data coordinator is fetched once by default (to get all entities), but not updated on a regular basis

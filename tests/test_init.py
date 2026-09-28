@@ -3,9 +3,13 @@
 import logging
 from unittest import mock
 
+import pytest
+from aiohttp import ClientConnectionError
+
 from homeassistant import data_entry_flow
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from myPyllant.api import MyPyllantAPI
 from myPyllant.http_client import AuthenticationFailed
@@ -13,7 +17,11 @@ from myPyllant.tests.generate_test_data import DATA_DIR
 from myPyllant.tests.utils import load_test_data
 
 from custom_components.mypyllant.const import DOMAIN
-from custom_components.mypyllant import async_setup_entry, async_unload_entry
+from custom_components.mypyllant import (
+    SystemCoordinator,
+    async_setup_entry,
+    async_unload_entry,
+)
 from custom_components.mypyllant.config_flow import DATA_SCHEMA
 from tests.utils import get_config_entry, test_user_input
 
@@ -81,3 +89,46 @@ async def test_async_setup(
         assert result, "Component did not unload successfully"
 
     await mocked_api.aiohttp_session.close()
+
+
+async def test_async_setup_retries_transient_login_error(hass: HomeAssistant):
+    """Temporary login/network errors should be retried by Home Assistant."""
+    config_entry = get_config_entry()
+    api = mock.MagicMock()
+    api.login = mock.AsyncMock(side_effect=ClientConnectionError("temporary"))
+    api.aiohttp_session.close = mock.AsyncMock()
+
+    with mock.patch(
+        "custom_components.mypyllant.MyPyllantAPI", return_value=api
+    ):
+        with pytest.raises(ConfigEntryNotReady):
+            await async_setup_entry(hass, config_entry)
+
+    api.aiohttp_session.close.assert_awaited_once()
+
+
+async def test_async_setup_retries_failed_first_system_refresh(
+    hass: HomeAssistant,
+):
+    """A failed initial coordinator refresh must not leave partial entities."""
+    config_entry = get_config_entry()
+    api = mock.MagicMock()
+    api.login = mock.AsyncMock()
+    api.aiohttp_session.close = mock.AsyncMock()
+
+    with (
+        mock.patch(
+            "custom_components.mypyllant.MyPyllantAPI", return_value=api
+        ),
+        mock.patch.object(
+            SystemCoordinator,
+            "async_config_entry_first_refresh",
+            new=mock.AsyncMock(
+                side_effect=ConfigEntryNotReady("temporary initial refresh failure")
+            ),
+        ),
+    ):
+        with pytest.raises(ConfigEntryNotReady):
+            await async_setup_entry(hass, config_entry)
+
+    api.aiohttp_session.close.assert_awaited_once()
