@@ -109,6 +109,10 @@ class SystemCoordinatorEntity(CoordinatorEntity):
     def device_info(self) -> DeviceInfo | None:
         return {"identifiers": {(DOMAIN, self.id_infix)}}
 
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
+
 
 class HolidayEntity(SystemCoordinatorEntity):
     def __init__(
@@ -245,7 +249,7 @@ def extract_quota_duration(exc_info: BaseException | None) -> int | None:
     if retry_after is not None:
         try:
             return int(retry_after)
-        except ValueError, TypeError:
+        except (ValueError, TypeError):
             pass
 
     import re
@@ -305,6 +309,10 @@ class DomesticHotWaterCoordinatorEntity(CoordinatorEntity):
             }
         }
 
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
+
 
 class ZoneCoordinatorEntity(CoordinatorEntity):
     coordinator: SystemCoordinator
@@ -349,7 +357,11 @@ class ZoneCoordinatorEntity(CoordinatorEntity):
 
     @property
     def available(self) -> bool:
-        return bool(self.zone.is_active)
+        return (
+            super().available
+            and self.coordinator.is_system_available(self.system.id)
+            and bool(self.zone.is_active)
+        )
 
 
 class AmbisenseCoordinatorEntity(CoordinatorEntity):
@@ -394,6 +406,10 @@ class AmbisenseCoordinatorEntity(CoordinatorEntity):
     @property
     def unique_id(self) -> str:
         return f"{DOMAIN}_{self.id_infix}_climate"
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
 
 
 class AmbisenseDeviceCoordinatorEntity(AmbisenseCoordinatorEntity):
@@ -456,3 +472,7 @@ class CircuitEntity(CoordinatorEntity):
             name=self.name_prefix,
             manufacturer=self.system.brand_name,
         )
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)

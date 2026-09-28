@@ -130,7 +130,7 @@ class SystemEebusSwitch(SystemCoordinatorEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        return (
+        return super().available and (
             self.system.eebus.get("spine_capable", False)
             if self.system.eebus
             else False

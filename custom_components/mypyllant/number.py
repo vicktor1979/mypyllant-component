@@ -164,7 +164,7 @@ class SystemManualCoolingDays(SystemCoordinatorEntity, NumberEntity):
 
     @property
     def available(self) -> bool:
-        return self.system.is_cooling_allowed
+        return super().available and self.system.is_cooling_allowed
 
 
 class ZoneQuickVetoDurationNumber(ZoneCoordinatorEntity, NumberEntity):
@@ -200,7 +200,7 @@ class ZoneQuickVetoDurationNumber(ZoneCoordinatorEntity, NumberEntity):
 
     @property
     def available(self) -> bool:
-        return self.zone.quick_veto_ongoing
+        return super().available and self.zone.quick_veto_ongoing
 
 
 class CircuitHeatingCurve(CircuitEntity, NumberEntity):

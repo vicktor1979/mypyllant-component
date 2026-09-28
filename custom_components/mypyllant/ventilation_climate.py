@@ -72,6 +72,10 @@ class VentilationClimate(CoordinatorEntity, ClimateEntity):
         return self.coordinator.data[self.system_index]
 
     @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
+
+    @property
     def ventilation(self) -> Ventilation:
         return self.system.ventilation[self.ventilation_index]
 

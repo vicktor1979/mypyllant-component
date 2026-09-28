@@ -135,6 +135,10 @@ class DomesticHotWaterEntity(CoordinatorEntity, WaterHeaterEntity):
         return self.coordinator.data[self.system_index]
 
     @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
+
+    @property
     def domestic_hot_water(self) -> DomesticHotWater:
         return self.system.domestic_hot_water[self.dhw_index]
 

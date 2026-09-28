@@ -441,6 +441,10 @@ class ZoneClimate(CoordinatorEntity, ClimateEntity):
         return self.coordinator.data[self.system_index]
 
     @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
+
+    @property
     def zone(self) -> Zone:
         return self.system.zones[self.zone_index]
 

@@ -13,7 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from myPyllant.models import System, AmbisenseDevice
+from myPyllant.models import System, AmbisenseDevice, Home
 
 from . import SystemCoordinator
 from .const import DOMAIN
@@ -34,11 +34,18 @@ async def async_setup_entry(
     coordinator: SystemCoordinator = hass.data[DOMAIN][config.entry_id][
         "system_coordinator"
     ]
+    sensors: EntityList[BinarySensorEntity] = EntityList()
+
+    # Gateway/API status is based on the homes list instead of coordinator.data,
+    # so a home that already fails during initial setup can still be identified.
+    for home in coordinator.homes:
+        sensors.append(lambda home=home: GatewayApiConnection(home, coordinator))
+
     if not coordinator.data:
-        _LOGGER.warning("No system data, skipping binary sensors")
+        _LOGGER.warning("No system data, only adding gateway status sensors")
+        async_add_entities(sensors)  # type: ignore
         return
 
-    sensors: EntityList[BinarySensorEntity] = EntityList()
     for index, system in enumerate(coordinator.data):
         sensors.append(lambda: ControlError(index, coordinator))
         sensors.append(lambda: ControlOnline(index, coordinator))
@@ -75,6 +82,62 @@ async def async_setup_entry(
     async_add_entities(sensors)  # type: ignore
 
 
+class GatewayApiConnection(CoordinatorEntity, BinarySensorEntity):
+    """Per-home status for the system API fetch."""
+
+    coordinator: SystemCoordinator
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, home: Home, coordinator: SystemCoordinator) -> None:
+        super().__init__(coordinator)
+        self.home = home
+        self.system_id = str(home.system_id)
+
+    @property
+    def available(self) -> bool:
+        # Keep this diagnostic entity available even when the associated system
+        # fetch failed, otherwise the useful failure details would be hidden.
+        return self.system_id in self.coordinator.system_failures or (
+            super().available
+            and self.system_id in self.coordinator.system_last_success
+        )
+
+    @property
+    def is_on(self) -> bool:
+        return (
+            self.system_id in self.coordinator.system_last_success
+            and self.coordinator.is_system_available(self.system_id)
+        )
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any]:
+        online_state = getattr(self.home, "online_state", None)
+        return self.coordinator.get_system_diagnostics(self.system_id) | {
+            "gateway_online_state": str(online_state) if online_state is not None else None,
+        }
+
+    @property
+    def name_prefix(self) -> str:
+        return self.home.home_name or self.home.nomenclature or self.system_id
+
+    @property
+    def name(self) -> str:
+        return f"{self.name_prefix} Gateway API Connection"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{DOMAIN}_{self.system_id}_gateway_api_connection"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.system_id}_home")},
+            name=self.name_prefix,
+            model=self.home.nomenclature,
+        )
+
+
 class SystemControlEntity(CoordinatorEntity, BinarySensorEntity):
     coordinator: SystemCoordinator
 
@@ -105,6 +168,10 @@ class SystemControlEntity(CoordinatorEntity, BinarySensorEntity):
     @property
     def device_info(self) -> DeviceInfo | None:
         return {"identifiers": {(DOMAIN, self.id_infix)}}
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
 
 
 class ControlError(SystemControlEntity):

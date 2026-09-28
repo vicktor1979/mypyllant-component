@@ -434,6 +434,10 @@ class HomeEntity(CoordinatorEntity, SensorEntity):
         return self.coordinator.data[self.system_index]
 
     @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
+
+    @property
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
         rts = {"rts": self.system.rts} if self.system.rts else {}
         mpc = {"mpc": self.system.mpc} if self.system.mpc else {}
@@ -658,6 +662,10 @@ class CircuitSensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.data[self.system_index]
 
     @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
+
+    @property
     def circuit(self) -> Circuit:
         return self.system.circuits[self.circuit_index]
 
@@ -878,6 +886,10 @@ class DataSensor(CoordinatorEntity, SensorEntity):
             self.native_value,
             self.unique_id,
         )
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system_id)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -1137,6 +1149,10 @@ class EfficiencySensor(CoordinatorEntity, SensorEntity):
         self.de_index = de_index
 
     @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system_id)
+
+    @property
     def device_data_list(self) -> list[DeviceData]:
         if self.de_index is None:
             return [
@@ -1247,6 +1263,10 @@ class SystemDeviceSensor(CoordinatorEntity, SensorEntity):
     @property
     def system(self) -> System:
         return self.coordinator.data[self.system_index]
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.is_system_available(self.system.id)
 
     @property
     def device(self) -> Device:

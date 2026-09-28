@@ -267,9 +267,71 @@ class MyPyllantCoordinator(DataUpdateCoordinator):
                 return
 
 
+class SystemUpdateFailure(TypedDict):
+    system_id: str
+    home_name: str
+    error: str
+    error_type: str
+    failed_at: str
+    status: int | None
+    url: str | None
+
+
 class SystemCoordinator(MyPyllantCoordinator):
     data: list[System]  # type: ignore
-    homes: list[Home] = []
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: MyPyllantAPI,
+        entry: ConfigEntry,
+        update_interval: timedelta | None,
+    ) -> None:
+        super().__init__(hass, api, entry, update_interval)
+        # Keep this state per coordinator instance. Homes used to be a class
+        # attribute, which can leak state between config entries.
+        self.homes: list[Home] = []
+        self.system_failures: dict[str, SystemUpdateFailure] = {}
+        self.system_last_success: dict[str, str] = {}
+
+    @staticmethod
+    def _home_system_id(home: Home) -> str:
+        return str(home.system_id)
+
+    @staticmethod
+    def _home_name(home: Home) -> str:
+        return home.home_name or home.nomenclature or str(home.system_id)
+
+    @staticmethod
+    def _failure_details(home: Home, exc: BaseException) -> SystemUpdateFailure:
+        request_info = getattr(exc, "request_info", None)
+        real_url = getattr(request_info, "real_url", None)
+        return {
+            "system_id": str(home.system_id),
+            "home_name": SystemCoordinator._home_name(home),
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "failed_at": dt.now(timezone.utc).isoformat(),
+            "status": getattr(exc, "status", None),
+            "url": str(real_url) if real_url is not None else None,
+        }
+
+    def is_system_available(self, system_id: str) -> bool:
+        """Return whether the latest fetch for this system succeeded."""
+        return system_id not in self.system_failures
+
+    def get_system_diagnostics(self, system_id: str) -> dict:
+        """Return per-system fetch diagnostics for diagnostic entities."""
+        failure = self.system_failures.get(system_id)
+        return {
+            "system_id": system_id,
+            "last_success": self.system_last_success.get(system_id),
+            "last_error": failure["error"] if failure else None,
+            "last_error_type": failure["error_type"] if failure else None,
+            "last_error_at": failure["failed_at"] if failure else None,
+            "last_http_status": failure["status"] if failure else None,
+            "last_error_url": failure["url"] if failure else None,
+        }
 
     async def _async_update_data(self) -> list[System]:  # type: ignore
         self._raise_if_quota_hit()
@@ -292,6 +354,7 @@ class SystemCoordinator(MyPyllantCoordinator):
             OPTION_FETCH_AMBISENSE_CAPABILITY, DEFAULT_FETCH_AMBISENSE_CAPABILITY
         )
         _LOGGER.debug("Starting async update data for SystemCoordinator")
+
         try:
             await self._refresh_session()
             if not self.homes:
@@ -304,37 +367,143 @@ class SystemCoordinator(MyPyllantCoordinator):
                 ]
             else:
                 _LOGGER.debug("Using cached homes for systems fetch")
-            data = [
-                s
-                async for s in await self.hass.async_add_executor_job(
-                    self.api.get_systems,
-                    include_connection_status,
-                    include_diagnostic_trouble_codes,
-                    include_rts,
-                    include_mpc,
-                    include_ambisense_rooms,
-                    include_energy_management,
-                    include_eebus,
-                    include_ambisense_capability,
-                    self.homes,
-                )
-            ]
-            # Clear quota state on successful fetch so future updates aren't blocked
-            self._clear_quota_state()
-            return data
-        except AmbisenseNoFacilityError as e:
-            _LOGGER.warning(
-                "Ambisense rooms not available for one or more systems, "
-                "consider disabling the Ambisense rooms option: %s",
-                e,
-            )
-            return []
         except ClientResponseError as e:
             self._set_quota_and_raise(e)
             raise UpdateFailed(str(e)) from e
         except (CancelledError, TimeoutError) as e:
             self._raise_api_down(e)
             return []  # mypy
+
+        previous_data = self.data or []
+        previous_by_id = {system.id: system for system in previous_data}
+        previous_failures = self.system_failures
+        current_failures: dict[str, SystemUpdateFailure] = {}
+        current_by_id: dict[str, System] = {}
+        successful_order: list[str] = []
+        successful_systems = 0
+        first_error: BaseException | None = None
+
+        # Fetch every home independently. A broken gateway must not abort the
+        # generator before the remaining homes have been refreshed.
+        for home in self.homes:
+            system_id = self._home_system_id(home)
+            try:
+                systems = [
+                    system
+                    async for system in await self.hass.async_add_executor_job(
+                        self.api.get_systems,
+                        include_connection_status,
+                        include_diagnostic_trouble_codes,
+                        include_rts,
+                        include_mpc,
+                        include_ambisense_rooms,
+                        include_energy_management,
+                        include_eebus,
+                        include_ambisense_capability,
+                        [home],
+                    )
+                ]
+                if not systems:
+                    raise RuntimeError(
+                        f"No system returned for home {self._home_name(home)}"
+                    )
+            except ClientResponseError as e:
+                # Account-wide quota errors must keep their original global
+                # backoff behaviour. Other HTTP errors are isolated per home.
+                self._set_quota_and_raise(e)
+                failure = self._failure_details(home, e)
+                current_failures[system_id] = failure
+                first_error = first_error or e
+            except AmbisenseNoFacilityError as e:
+                failure = self._failure_details(home, e)
+                current_failures[system_id] = failure
+                first_error = first_error or e
+                _LOGGER.warning(
+                    "Ambisense rooms are not available for %s; keeping the last "
+                    "known system data. Consider disabling the Ambisense rooms option: %s",
+                    self._home_name(home),
+                    e,
+                )
+            except TimeoutError as e:
+                failure = self._failure_details(home, e)
+                current_failures[system_id] = failure
+                first_error = first_error or e
+            except ValueError as e:
+                # myPyllant may raise ValueError for a home-specific unsupported
+                # control identifier. Isolate that home just like an HTTP error.
+                failure = self._failure_details(home, e)
+                current_failures[system_id] = failure
+                first_error = first_error or e
+            except CancelledError:
+                raise
+            else:
+                successful_systems += len(systems)
+                now = dt.now(timezone.utc).isoformat()
+                for system in systems:
+                    current_by_id[system.id] = system
+                    successful_order.append(system.id)
+                    self.system_last_success[system.id] = now
+                    if system.id in previous_failures:
+                        _LOGGER.info(
+                            "System %s (%s) recovered",
+                            system.id,
+                            self._home_name(home),
+                        )
+                continue
+
+            if system_id not in previous_failures:
+                _LOGGER.warning(
+                    "System %s (%s) update failed; isolating this system: %s",
+                    system_id,
+                    self._home_name(home),
+                    current_failures[system_id]["error"],
+                )
+            else:
+                _LOGGER.debug(
+                    "System %s (%s) is still unavailable: %s",
+                    system_id,
+                    self._home_name(home),
+                    current_failures[system_id]["error"],
+                )
+
+            # Keep the previous object in exactly the same logical home slot so
+            # existing entities keep their system/index mapping. Its entities
+            # are marked unavailable by is_system_available().
+            if system_id in previous_by_id:
+                current_by_id[system_id] = previous_by_id[system_id]
+
+        self.system_failures = current_failures
+
+        # If every home failed, retain the original coordinator-wide failure
+        # semantics. This prevents a complete API outage from looking healthy.
+        if self.homes and successful_systems == 0:
+            if isinstance(first_error, TimeoutError):
+                self._raise_api_down(first_error)
+            if first_error is not None:
+                raise UpdateFailed(
+                    f"All myVAILLANT systems failed to update: {first_error}"
+                ) from first_error
+            raise UpdateFailed("No myVAILLANT systems returned by the API")
+
+        # Preserve existing list indexes. If a home was missing during initial
+        # setup and later recovers, inserting it in the middle would make every
+        # entity after it point at the wrong system. Existing systems therefore
+        # keep their previous order; newly discovered/recovered systems are
+        # appended until the integration is reloaded and entities are rebuilt.
+        previous_order = [
+            system.id for system in previous_data if system.id in current_by_id
+        ]
+        new_order = [
+            system_id
+            for system_id in successful_order
+            if system_id not in previous_order
+        ]
+        data = [current_by_id[system_id] for system_id in previous_order + new_order]
+
+        # Clear quota/API-down state when at least one home was refreshed. A
+        # home-specific failure must not suppress refreshes for healthy homes.
+        self._clear_quota_state()
+        return data
 
 
 class SystemWithDeviceData(TypedDict):
@@ -344,6 +513,21 @@ class SystemWithDeviceData(TypedDict):
 
 class DailyDataCoordinator(MyPyllantCoordinator):
     data: dict[str, SystemWithDeviceData]
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: MyPyllantAPI,
+        entry: ConfigEntry,
+        update_interval: timedelta | None,
+    ) -> None:
+        super().__init__(hass, api, entry, update_interval)
+        self.system_failures: dict[str, SystemUpdateFailure] = {}
+        self.system_last_success: dict[str, str] = {}
+
+    def is_system_available(self, system_id: str) -> bool:
+        """Return whether daily data for a system was refreshed successfully."""
+        return system_id not in self.system_failures
 
     async def is_sensor_disabled(self, unique_id: str) -> bool:
         """
@@ -361,38 +545,72 @@ class DailyDataCoordinator(MyPyllantCoordinator):
         _LOGGER.debug("Starting async update data for DailyDataCoordinator")
         try:
             await self._refresh_session()
-            data: dict[str, SystemWithDeviceData] = {}
-            if (
-                "system_coordinator" not in self.hass_data
-                or not self.hass_data["system_coordinator"].data
-            ):
-                raise UpdateFailed("No systems available for daily data fetch")
-            for system in self.hass_data["system_coordinator"].data:
-                today = dt.now(system.timezone).replace(
-                    microsecond=0, second=0, minute=0, hour=0
-                )
-                # Fetch yesterday + today so the previous day's final hour (23:00-00:00)
-                # is backfilled once it finalises after midnight. Date-based construction
-                # keeps the start on local midnight across DST transitions (a raw
-                # `today - timedelta(days=1)` is off by an hour on DST-change days).
-                yesterday = (today - timedelta(days=1)).date()
-                start = dt(
-                    yesterday.year,
-                    yesterday.month,
-                    yesterday.day,
-                    tzinfo=system.timezone,
-                )
-                end = today + timedelta(days=1)
-                _LOGGER.debug(
-                    "Getting daily data for %s from %s to %s", system.id, start, end
-                )
+        except ClientResponseError as e:
+            self._set_quota_and_raise(e)
+            raise UpdateFailed(str(e)) from e
+        except (CancelledError, TimeoutError) as e:
+            self._raise_api_down(e)
+            return {}  # mypy
+
+        if (
+            "system_coordinator" not in self.hass_data
+            or not self.hass_data["system_coordinator"].data
+        ):
+            raise UpdateFailed("No systems available for daily data fetch")
+
+        system_coordinator: SystemCoordinator = self.hass_data["system_coordinator"]
+        previous_data = self.data or {}
+        previous_failures = self.system_failures
+        current_failures: dict[str, SystemUpdateFailure] = {}
+        data: dict[str, SystemWithDeviceData] = {}
+
+        for system in system_coordinator.data:
+            system_id = system.id
+
+            # If the normal system refresh already identified this gateway as
+            # unavailable, do not make additional daily-data requests to it.
+            if not system_coordinator.is_system_available(system_id):
+                failure = system_coordinator.system_failures.get(system_id)
+                if failure is not None:
+                    current_failures[system_id] = failure.copy()
+                else:
+                    current_failures[system_id] = SystemCoordinator._failure_details(
+                        system.home,
+                        RuntimeError("System refresh is unavailable"),
+                    )
+                if system_id in previous_data:
+                    data[system_id] = previous_data[system_id]
+                continue
+
+            today = dt.now(system.timezone).replace(
+                microsecond=0, second=0, minute=0, hour=0
+            )
+            yesterday = (today - timedelta(days=1)).date()
+            start = dt(
+                yesterday.year,
+                yesterday.month,
+                yesterday.day,
+                tzinfo=system.timezone,
+            )
+            end = today + timedelta(days=1)
+            _LOGGER.debug(
+                "Getting daily data for %s from %s to %s", system.id, start, end
+            )
+
+            system_data: SystemWithDeviceData = {
+                "home_name": system.home.home_name or system.home.nomenclature,
+                "devices_data": [],
+            }
+
+            try:
                 if len(system.devices) == 0:
                     _LOGGER.debug("No devices in %s", system.id)
+                    data[system_id] = system_data
+                    self.system_last_success[system_id] = dt.now(
+                        timezone.utc
+                    ).isoformat()
                     continue
-                data[system.id] = {
-                    "home_name": system.home.home_name or system.home.nomenclature,
-                    "devices_data": [],
-                }
+
                 for de_index, device in enumerate(system.devices):
                     for da_index, dd in enumerate(device.data):
                         sensor_id = f"{DOMAIN}_{device.system_id}_{device.device_uuid}_{da_index}_{de_index}"
@@ -401,15 +619,42 @@ class DailyDataCoordinator(MyPyllantCoordinator):
                     device_data = self.api.get_data_by_device(
                         device, DeviceDataBucketResolution.HOUR, start, end
                     )
-                    data[system.id]["devices_data"].append(
+                    system_data["devices_data"].append(
                         [da async for da in device_data]
                     )
-            # Clear quota state on successful fetch so future updates aren't blocked
-            self._clear_quota_state()
-            return data
-        except ClientResponseError as e:
-            self._set_quota_and_raise(e)
-            raise UpdateFailed(str(e)) from e
-        except (CancelledError, TimeoutError) as e:
-            self._raise_api_down(e)
-            return {}  # mypy
+            except ClientResponseError as e:
+                self._set_quota_and_raise(e)
+                current_failures[system_id] = SystemCoordinator._failure_details(
+                    system.home, e
+                )
+            except TimeoutError as e:
+                current_failures[system_id] = SystemCoordinator._failure_details(
+                    system.home, e
+                )
+            except CancelledError:
+                raise
+            else:
+                data[system_id] = system_data
+                self.system_last_success[system_id] = dt.now(timezone.utc).isoformat()
+                if system_id in previous_failures:
+                    _LOGGER.info("Daily data for system %s recovered", system_id)
+                continue
+
+            if system_id not in previous_failures:
+                _LOGGER.warning(
+                    "Daily data update failed for system %s; keeping previous data: %s",
+                    system_id,
+                    current_failures[system_id]["error"],
+                )
+            else:
+                _LOGGER.debug(
+                    "Daily data for system %s is still unavailable: %s",
+                    system_id,
+                    current_failures[system_id]["error"],
+                )
+            if system_id in previous_data:
+                data[system_id] = previous_data[system_id]
+
+        self.system_failures = current_failures
+        self._clear_quota_state()
+        return data
