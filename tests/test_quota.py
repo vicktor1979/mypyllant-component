@@ -93,6 +93,23 @@ async def test_quota_duration_from_retry_after_header():
     assert extract_quota_duration(exc) == 1800
 
 
+async def test_quota_duration_from_retry_after_http_date():
+    """Retry-After HTTP-date should be converted to remaining seconds."""
+    with freeze_time("2026-09-28 12:00:00+00:00"):
+        exc = ClientResponseError(
+            request_info=RequestInfo(
+                url="https://api.vaillant-group.com/service-connected-control/end-user-app-api/v1/homes",  # type: ignore
+                method="GET",
+                headers=None,  # type: ignore
+            ),
+            history=None,  # type: ignore
+            status=403,
+            message="Quota Exceeded",
+            headers={"Retry-After": "Mon, 28 Sep 2026 12:30:00 GMT"},  # type: ignore
+        )
+        assert extract_quota_duration(exc) == 1800
+
+
 async def test_quota_duration_retry_after_takes_precedence_over_body():
     """When both Retry-After header and body text are present, header wins."""
     exc = ClientResponseError(

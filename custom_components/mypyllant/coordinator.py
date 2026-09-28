@@ -35,6 +35,7 @@ from custom_components.mypyllant.const import (
     OPTION_FETCH_DTC,
     DEFAULT_FETCH_DTC,
 )
+from custom_components.mypyllant.quota import QuotaBackoffStore
 from custom_components.mypyllant.utils import (
     is_quota_exceeded_exception,
     extract_quota_duration,
@@ -73,6 +74,20 @@ class MyPyllantCoordinator(DataUpdateCoordinator):
     @property
     def hass_data(self):
         return self.hass.data[DOMAIN][self.entry.entry_id]
+
+    @property
+    def quota_backoff(self) -> QuotaBackoffStore | None:
+        """Return the shared persistent quota backoff store, if configured."""
+        return self.hass_data.get("quota_backoff")
+
+    async def _raise_if_persistent_quota_hit(self) -> None:
+        """Block API access while a persisted account quota is still active."""
+        quota_backoff = self.quota_backoff
+        if quota_backoff is None:
+            return
+        await quota_backoff.async_load()
+        if quota_backoff.is_active:
+            raise UpdateFailed(quota_backoff.retry_message(self.__class__.__name__))
 
     @property
     def _quota_hit_time(self) -> dt | None:
@@ -178,19 +193,19 @@ class MyPyllantCoordinator(DataUpdateCoordinator):
             f"for another {QUOTA_PAUSE_INTERVAL}s"
         ) from exc_info
 
-    def _set_quota_and_raise(self, exc_info: ClientResponseError) -> None:
-        """
-        Check if the API raises a ClientResponseError with "Quota Exceeded" in the message
-        Raises UpdateFailed if a quota error is detected
-        """
+    async def _set_quota_and_raise(self, exc_info: ClientResponseError) -> None:
+        """Persist and apply Vaillant quota backoff before raising UpdateFailed."""
         if is_quota_exceeded_exception(exc_info):
             duration = extract_quota_duration(exc_info)
             self._quota_hit_time = dt.now(timezone.utc)
-            if duration:
-                self._quota_end_time = dt.now(timezone.utc) + timedelta(
-                    seconds=duration
-                )
+            if duration is None:
+                duration = QUOTA_PAUSE_INTERVAL
+            self._quota_end_time = dt.now(timezone.utc) + timedelta(
+                seconds=duration
+            )
             self._quota_exc_info = exc_info
+            if self.quota_backoff is not None:
+                await self.quota_backoff.async_set_from_exception(exc_info)
             self._raise_if_quota_hit()
 
     def _raise_if_quota_hit(self) -> None:
@@ -291,6 +306,7 @@ class SystemCoordinator(MyPyllantCoordinator):
         # Keep this state per coordinator instance. Homes used to be a class
         # attribute, which can leak state between config entries.
         self.homes: list[Home] = []
+        self.homes_last_refresh: str | None = None
         self.system_failures: dict[str, SystemUpdateFailure] = {}
         self.system_last_success: dict[str, str] = {}
 
@@ -301,6 +317,13 @@ class SystemCoordinator(MyPyllantCoordinator):
     @staticmethod
     def _home_name(home: Home) -> str:
         return home.home_name or home.nomenclature or str(home.system_id)
+
+    def get_home(self, system_id: str) -> Home | None:
+        """Return the latest Home object for a system ID."""
+        return next(
+            (home for home in self.homes if str(home.system_id) == system_id),
+            None,
+        )
 
     @staticmethod
     def _failure_details(home: Home, exc: BaseException) -> SystemUpdateFailure:
@@ -331,9 +354,11 @@ class SystemCoordinator(MyPyllantCoordinator):
             "last_error_at": failure["failed_at"] if failure else None,
             "last_http_status": failure["status"] if failure else None,
             "last_error_url": failure["url"] if failure else None,
+            "home_state_last_refreshed": self.homes_last_refresh,
         }
 
     async def _async_update_data(self) -> list[System]:  # type: ignore
+        await self._raise_if_persistent_quota_hit()
         self._raise_if_quota_hit()
         include_connection_status = self.entry.options.get(
             OPTION_FETCH_CONNECTION_STATUS, DEFAULT_FETCH_CONNECTION_STATUS
@@ -357,18 +382,23 @@ class SystemCoordinator(MyPyllantCoordinator):
 
         try:
             await self._refresh_session()
+            # Refresh the homes list on every normal coordinator cycle. The
+            # Home object carries the gateway ONLINE/OFFLINE state, while the
+            # per-system endpoints may still return cached boiler data for an
+            # offline gateway. One account-level homes request keeps that
+            # diagnostic state current without adding one request per gateway.
+            _LOGGER.debug("Refreshing homes and gateway online states")
+            self.homes = [
+                h
+                async for h in await self.hass.async_add_executor_job(
+                    self.api.get_homes
+                )
+            ]
+            self.homes_last_refresh = dt.now(timezone.utc).isoformat()
             if not self.homes:
-                _LOGGER.debug("Fetching homes for systems fetch")
-                self.homes = [
-                    h
-                    async for h in await self.hass.async_add_executor_job(
-                        self.api.get_homes
-                    )
-                ]
-            else:
-                _LOGGER.debug("Using cached homes for systems fetch")
+                raise UpdateFailed("No myVAILLANT homes returned by the API")
         except ClientResponseError as e:
-            self._set_quota_and_raise(e)
+            await self._set_quota_and_raise(e)
             raise UpdateFailed(str(e)) from e
         except (CancelledError, TimeoutError) as e:
             self._raise_api_down(e)
@@ -410,7 +440,7 @@ class SystemCoordinator(MyPyllantCoordinator):
             except ClientResponseError as e:
                 # Account-wide quota errors must keep their original global
                 # backoff behaviour. Other HTTP errors are isolated per home.
-                self._set_quota_and_raise(e)
+                await self._set_quota_and_raise(e)
                 failure = self._failure_details(home, e)
                 current_failures[system_id] = failure
                 first_error = first_error or e
@@ -541,12 +571,13 @@ class DailyDataCoordinator(MyPyllantCoordinator):
         return False
 
     async def _async_update_data(self) -> dict[str, SystemWithDeviceData]:
+        await self._raise_if_persistent_quota_hit()
         self._raise_if_quota_hit()
         _LOGGER.debug("Starting async update data for DailyDataCoordinator")
         try:
             await self._refresh_session()
         except ClientResponseError as e:
-            self._set_quota_and_raise(e)
+            await self._set_quota_and_raise(e)
             raise UpdateFailed(str(e)) from e
         except (CancelledError, TimeoutError) as e:
             self._raise_api_down(e)
@@ -623,7 +654,7 @@ class DailyDataCoordinator(MyPyllantCoordinator):
                         [da async for da in device_data]
                     )
             except ClientResponseError as e:
-                self._set_quota_and_raise(e)
+                await self._set_quota_and_raise(e)
                 current_failures[system_id] = SystemCoordinator._failure_details(
                     system.home, e
                 )

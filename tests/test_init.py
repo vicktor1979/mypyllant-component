@@ -132,3 +132,31 @@ async def test_async_setup_retries_failed_first_system_refresh(
             await async_setup_entry(hass, config_entry)
 
     api.aiohttp_session.close.assert_awaited_once()
+
+
+async def test_async_setup_skips_api_while_persisted_quota_is_active(
+    hass: HomeAssistant,
+):
+    """A reload/restart must not make API calls during persisted quota backoff."""
+    config_entry = get_config_entry()
+    quota_backoff = mock.MagicMock()
+    quota_backoff.async_load = mock.AsyncMock()
+    quota_backoff.is_active = True
+    quota_backoff.retry_message.return_value = "quota backoff active"
+
+    api_factory = mock.MagicMock()
+    with (
+        mock.patch(
+            "custom_components.mypyllant.QuotaBackoffStore",
+            return_value=quota_backoff,
+        ),
+        mock.patch(
+            "custom_components.mypyllant.MyPyllantAPI",
+            api_factory,
+        ),
+    ):
+        with pytest.raises(ConfigEntryNotReady, match="quota backoff active"):
+            await async_setup_entry(hass, config_entry)
+
+    quota_backoff.async_load.assert_awaited_once()
+    api_factory.assert_not_called()

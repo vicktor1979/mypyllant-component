@@ -14,6 +14,8 @@ from custom_components.mypyllant.binary_sensor import (
     CircuitIsCoolingAllowed,
     ControlError,
     ControlOnline,
+    GatewayApiConnection,
+    GatewayOnline,
     SystemControlEntity,
     async_setup_entry,
     ZoneIsManualCoolingActive,
@@ -107,3 +109,39 @@ async def test_is_manual_cooling_active(
         manual_cooling = ZoneIsManualCoolingActive(0, 0, system_coordinator_mock)
         assert not manual_cooling.is_on
         await mocked_api.aiohttp_session.close()
+
+
+async def test_gateway_api_health_and_gateway_online_state_are_independent(
+    mypyllant_aioresponses,
+    mocked_api: MyPyllantAPI,
+    system_coordinator_mock: SystemCoordinator,
+):
+    """Cached API data may succeed even while the physical gateway is offline."""
+    test_data = list_test_data(only_with_systems=True)[0]
+    with mypyllant_aioresponses(test_data) as _:
+        system_coordinator_mock.data = (
+            await system_coordinator_mock._async_update_data()
+        )
+
+    home = system_coordinator_mock.homes[0]
+    offline_home = Mock(
+        system_id=home.system_id,
+        home_name=home.home_name,
+        nomenclature=home.nomenclature,
+        online_state="OFFLINE",
+    )
+    system_coordinator_mock.get_home = Mock(return_value=offline_home)
+
+    api_connection = GatewayApiConnection(home, system_coordinator_mock)
+    gateway_online = GatewayOnline(home, system_coordinator_mock)
+
+    assert api_connection.is_on is True
+    assert gateway_online.is_on is False
+    assert gateway_online.gateway_online_state == "OFFLINE"
+    assert api_connection.extra_state_attributes["api_fetch_success"] is True
+    assert (
+        api_connection.extra_state_attributes["gateway_online_state"]
+        == "OFFLINE"
+    )
+
+    await mocked_api.aiohttp_session.close()

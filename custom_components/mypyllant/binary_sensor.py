@@ -40,6 +40,7 @@ async def async_setup_entry(
     # so a home that already fails during initial setup can still be identified.
     for home in coordinator.homes:
         sensors.append(lambda home=home: GatewayApiConnection(home, coordinator))
+        sensors.append(lambda home=home: GatewayOnline(home, coordinator))
 
     if not coordinator.data:
         _LOGGER.warning("No system data, only adding gateway status sensors")
@@ -83,7 +84,7 @@ async def async_setup_entry(
 
 
 class GatewayApiConnection(CoordinatorEntity, BinarySensorEntity):
-    """Per-home status for the system API fetch."""
+    """Per-home status for the latest system API fetch."""
 
     coordinator: SystemCoordinator
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -95,9 +96,14 @@ class GatewayApiConnection(CoordinatorEntity, BinarySensorEntity):
         self.system_id = str(home.system_id)
 
     @property
+    def current_home(self) -> Home:
+        """Use the latest refreshed Home object for live gateway state."""
+        return self.coordinator.get_home(self.system_id) or self.home
+
+    @property
     def available(self) -> bool:
-        # Keep this diagnostic entity available even when the associated system
-        # fetch failed, otherwise the useful failure details would be hidden.
+        # Keep this diagnostic entity available when the associated system fetch
+        # failed, otherwise the useful failure details would be hidden.
         return self.system_id in self.coordinator.system_failures or (
             super().available
             and self.system_id in self.coordinator.system_last_success
@@ -105,6 +111,9 @@ class GatewayApiConnection(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
+        # This entity intentionally represents API fetch health, not the
+        # gateway's physical cloud connectivity. An offline gateway may still
+        # have cached system data returned successfully by Vaillant.
         return (
             self.system_id in self.coordinator.system_last_success
             and self.coordinator.is_system_available(self.system_id)
@@ -112,14 +121,18 @@ class GatewayApiConnection(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def extra_state_attributes(self) -> Mapping[str, Any]:
-        online_state = getattr(self.home, "online_state", None)
+        online_state = getattr(self.current_home, "online_state", None)
         return self.coordinator.get_system_diagnostics(self.system_id) | {
-            "gateway_online_state": str(online_state) if online_state is not None else None,
+            "api_fetch_success": self.is_on,
+            "gateway_online_state": str(online_state)
+            if online_state is not None
+            else None,
         }
 
     @property
     def name_prefix(self) -> str:
-        return self.home.home_name or self.home.nomenclature or self.system_id
+        home = self.current_home
+        return home.home_name or home.nomenclature or self.system_id
 
     @property
     def name(self) -> str:
@@ -131,10 +144,82 @@ class GatewayApiConnection(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
+        home = self.current_home
         return DeviceInfo(
             identifiers={(DOMAIN, f"{self.system_id}_home")},
             name=self.name_prefix,
-            model=self.home.nomenclature,
+            model=home.nomenclature,
+        )
+
+
+class GatewayOnline(CoordinatorEntity, BinarySensorEntity):
+    """Latest gateway ONLINE/OFFLINE state reported by Vaillant homes API."""
+
+    coordinator: SystemCoordinator
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, home: Home, coordinator: SystemCoordinator) -> None:
+        super().__init__(coordinator)
+        self.home = home
+        self.system_id = str(home.system_id)
+
+    @property
+    def current_home(self) -> Home:
+        return self.coordinator.get_home(self.system_id) or self.home
+
+    @property
+    def gateway_online_state(self) -> str | None:
+        state = getattr(self.current_home, "online_state", None)
+        if state is None:
+            return None
+        if hasattr(state, "value"):
+            state = state.value
+        return str(state).upper()
+
+    @property
+    def available(self) -> bool:
+        # The state is independent from per-system API fetch availability. Keep
+        # the last known ONLINE/OFFLINE state visible even when a system call
+        # fails; home_state_last_refreshed shows how fresh it is.
+        return self.gateway_online_state is not None
+
+    @property
+    def is_on(self) -> bool:
+        return self.gateway_online_state == "ONLINE"
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any]:
+        return {
+            "system_id": self.system_id,
+            "gateway_online_state": self.gateway_online_state,
+            "home_state_last_refreshed": self.coordinator.homes_last_refresh,
+            "api_fetch_success": (
+                self.system_id in self.coordinator.system_last_success
+                and self.coordinator.is_system_available(self.system_id)
+            ),
+        }
+
+    @property
+    def name_prefix(self) -> str:
+        home = self.current_home
+        return home.home_name or home.nomenclature or self.system_id
+
+    @property
+    def name(self) -> str:
+        return f"{self.name_prefix} Gateway Online"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{DOMAIN}_{self.system_id}_gateway_online"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        home = self.current_home
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.system_id}_home")},
+            name=self.name_prefix,
+            model=home.nomenclature,
         )
 
 

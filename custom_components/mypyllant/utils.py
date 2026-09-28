@@ -4,7 +4,8 @@ import logging
 import typing
 from asyncio.exceptions import CancelledError
 from collections.abc import MutableSequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import TypeVar
 
 from aiohttp.client_exceptions import ClientResponseError
@@ -250,7 +251,22 @@ def extract_quota_duration(exc_info: BaseException | None) -> int | None:
         try:
             return int(retry_after)
         except (ValueError, TypeError):
-            pass
+            # Retry-After may also be an HTTP-date.
+            try:
+                retry_at = parsedate_to_datetime(str(retry_after))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(
+                    0,
+                    int(
+                        (
+                            retry_at.astimezone(timezone.utc)
+                            - datetime.now(timezone.utc)
+                        ).total_seconds()
+                    ),
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
 
     import re
 

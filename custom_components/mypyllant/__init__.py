@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from aiohttp import ClientError
+from aiohttp import ClientError, ClientResponseError
 from datetime import datetime as dt, timedelta
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
@@ -41,6 +41,8 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL_DAILY,
 )
 from .coordinator import SystemCoordinator, DailyDataCoordinator
+from .quota import QuotaBackoffStore
+from .utils import is_quota_exceeded_exception
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +104,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {}
 
+    # Quota state is persisted per config entry, so a reload or Home Assistant
+    # restart cannot accidentally bypass Vaillant's backoff window and burn
+    # additional requests while the account is still rate limited.
+    quota_backoff = QuotaBackoffStore(hass, entry.entry_id)
+    await quota_backoff.async_load()
+    hass.data[DOMAIN][entry.entry_id]["quota_backoff"] = quota_backoff
+    if quota_backoff.is_active:
+        raise ConfigEntryNotReady(quota_backoff.retry_message("config entry setup"))
+
     _LOGGER.debug("Creating API and logging in with %s in realm %s", username, country)
     api = MyPyllantAPI(
         username=username, password=password, brand=brand, country=country
@@ -111,6 +122,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except (AuthenticationFailed, LoginEndpointInvalid, RealmInvalid) as e:
         await api.aiohttp_session.close()
         raise ConfigEntryAuthFailed from e
+    except ClientResponseError as e:
+        if is_quota_exceeded_exception(e):
+            await quota_backoff.async_set_from_exception(e)
+            await api.aiohttp_session.close()
+            raise ConfigEntryNotReady(
+                quota_backoff.retry_message("login")
+            ) from e
+        await api.aiohttp_session.close()
+        raise ConfigEntryNotReady(
+            f"Temporary myVAILLANT HTTP error during login: {e}"
+        ) from e
     except (ClientError, TimeoutError, OSError) as e:
         # Treat temporary login/network failures as a setup retry instead of a
         # permanent failed setup.  This is especially important when several
