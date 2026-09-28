@@ -36,9 +36,30 @@ from custom_components.mypyllant.sensor import (
     SystemBottomDHWTemperatureSensor,
     SystemTopCHTemperatureSensor,
     SystemDeviceCurrentPowerSensor,
+    SystemAPIRequestCount,
 )
 from custom_components.mypyllant.const import DOMAIN
 from tests.utils import get_config_entry
+
+
+def test_api_request_count_unique_id_is_config_entry_specific(hass):
+    """API request counters from different config entries must not collide."""
+    hass.data[DATA_REGISTRY] = EntityRegistry(hass)
+
+    coordinator_1 = MagicMock()
+    coordinator_1.hass = hass
+    coordinator_1.entry.entry_id = "entry_1"
+
+    coordinator_2 = MagicMock()
+    coordinator_2.hass = hass
+    coordinator_2.entry.entry_id = "entry_2"
+
+    sensor_1 = SystemAPIRequestCount(coordinator_1)
+    sensor_2 = SystemAPIRequestCount(coordinator_2)
+
+    assert sensor_1.unique_id == f"{DOMAIN}_entry_1_api_request_count"
+    assert sensor_2.unique_id == f"{DOMAIN}_entry_2_api_request_count"
+    assert sensor_1.unique_id != sensor_2.unique_id
 
 
 @pytest.mark.parametrize("test_data", list_test_data(only_with_systems=True))

@@ -14,6 +14,7 @@ from homeassistant.components.recorder.statistics import (
     statistics_during_period,
 )
 from homeassistant.components.sensor import (
+    DOMAIN as SENSOR_DOMAIN,
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
@@ -30,6 +31,7 @@ from homeassistant.const import (
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from myPyllant.models import (
@@ -1371,7 +1373,32 @@ class SystemAPIRequestCount(SensorEntity, CoordinatorEntity):
 
     @property
     def unique_id(self) -> str:
-        return f"{DOMAIN}_api_request_count"
+        """Return a unique ID for the API request counter of this config entry.
+
+        Older versions used one global ID (``mypyllant_api_request_count``) for
+        every configured myVAILLANT account.  With multiple config entries this
+        caused Home Assistant to reject all but the first entity as duplicates.
+
+        Preserve the legacy ID for the config entry that already owns it in the
+        entity registry, while assigning a config-entry-specific ID to every
+        other account.  This avoids both the duplicate-ID error and an orphaned
+        legacy entity after upgrading.
+        """
+        legacy_unique_id = f"{DOMAIN}_api_request_count"
+        registry = er.async_get(self.coordinator.hass)
+        legacy_entity_id = registry.async_get_entity_id(
+            SENSOR_DOMAIN, DOMAIN, legacy_unique_id
+        )
+
+        if legacy_entity_id is not None:
+            legacy_entry = registry.async_get(legacy_entity_id)
+            if (
+                legacy_entry is not None
+                and legacy_entry.config_entry_id == self.coordinator.entry.entry_id
+            ):
+                return legacy_unique_id
+
+        return f"{DOMAIN}_{self.coordinator.entry.entry_id}_api_request_count"
 
     @property
     def name(self):
