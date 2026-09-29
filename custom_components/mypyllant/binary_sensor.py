@@ -27,6 +27,20 @@ from .utils import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _get_home_online_state(home: Home) -> str | None:
+    """Return the gateway cloud state from current and legacy Home model shapes."""
+    state = getattr(home, "online_state", None)
+    if state is None:
+        extra_fields = getattr(home, "extra_fields", None)
+        if isinstance(extra_fields, Mapping):
+            state = extra_fields.get("online_state")
+    if state is None:
+        return None
+    if hasattr(state, "value"):
+        state = state.value
+    return str(state).upper()
+
+
 async def async_setup_entry(
     hass: HomeAssistant, config: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -121,12 +135,10 @@ class GatewayApiConnection(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def extra_state_attributes(self) -> Mapping[str, Any]:
-        online_state = getattr(self.current_home, "online_state", None)
+        online_state = _get_home_online_state(self.current_home)
         return self.coordinator.get_system_diagnostics(self.system_id) | {
             "api_fetch_success": self.is_on,
-            "gateway_online_state": str(online_state)
-            if online_state is not None
-            else None,
+            "gateway_online_state": online_state,
         }
 
     @property
@@ -170,12 +182,7 @@ class GatewayOnline(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def gateway_online_state(self) -> str | None:
-        state = getattr(self.current_home, "online_state", None)
-        if state is None:
-            return None
-        if hasattr(state, "value"):
-            state = state.value
-        return str(state).upper()
+        return _get_home_online_state(self.current_home)
 
     @property
     def available(self) -> bool:
@@ -292,6 +299,8 @@ class ControlError(SystemControlEntity):
 
 
 class ControlOnline(SystemControlEntity):
+    """Optional system connection status returned by the dedicated API call."""
+
     def __init__(
         self,
         system_index: int,
@@ -300,15 +309,31 @@ class ControlOnline(SystemControlEntity):
         super().__init__(system_index, coordinator)
 
     @property
+    def available(self) -> bool:
+        # `System.connected` is None when the optional "Fetch system connection
+        # status" setting is disabled or the API did not provide a value. Do
+        # not turn None into False/"Disconnected", because that is misleading.
+        return super().available and self.system.connected is not None
+
+    @property
     def is_on(self) -> bool:
         return self.system.connected is True
 
     @property
+    def extra_state_attributes(self) -> Mapping[str, Any]:
+        return {
+            "connection_status_fetched": self.system.connected is not None,
+            "connection_status_value": self.system.connected,
+        }
+
+    @property
     def name(self) -> str:
-        return f"{self.name_prefix} Online Status"
+        return f"{self.name_prefix} System Connection Status"
 
     @property
     def unique_id(self) -> str:
+        # Keep the existing unique_id so entity registry references and
+        # automations are not broken by the clearer friendly name.
         return f"{DOMAIN}_{self.id_infix}_control_online"
 
     @property

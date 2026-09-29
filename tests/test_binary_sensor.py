@@ -128,8 +128,10 @@ async def test_gateway_api_health_and_gateway_online_state_are_independent(
         system_id=home.system_id,
         home_name=home.home_name,
         nomenclature=home.nomenclature,
-        online_state="OFFLINE",
+        extra_fields={"online_state": "OFFLINE"},
     )
+    # Mock would otherwise synthesize a fake attribute for getattr().
+    offline_home.online_state = None
     system_coordinator_mock.get_home = Mock(return_value=offline_home)
 
     api_connection = GatewayApiConnection(home, system_coordinator_mock)
@@ -145,3 +147,42 @@ async def test_gateway_api_health_and_gateway_online_state_are_independent(
     )
 
     await mocked_api.aiohttp_session.close()
+
+
+def test_gateway_online_reads_online_state_from_extra_fields(system_coordinator_mock):
+    """myPyllant Home currently stores online_state in extra_fields."""
+    home = Mock(
+        system_id="system-1",
+        home_name="Test home",
+        nomenclature="VR 921",
+        extra_fields={"online_state": "ONLINE"},
+    )
+    home.online_state = None
+    system_coordinator_mock.get_home = Mock(return_value=home)
+
+    gateway_online = GatewayOnline(home, system_coordinator_mock)
+
+    assert gateway_online.available is True
+    assert gateway_online.is_on is True
+    assert gateway_online.gateway_online_state == "ONLINE"
+
+
+def test_control_online_unknown_is_unavailable_not_disconnected(
+    system_coordinator_mock,
+):
+    """Do not display None connection data as a false/disconnected status."""
+    system = Mock()
+    system.id = "system-1"
+    system.connected = None
+    system.home.home_name = "Test home"
+    system.home.nomenclature = "VR 921"
+    system_coordinator_mock.data = [system]
+    system_coordinator_mock.last_update_success = True
+    system_coordinator_mock.is_system_available = Mock(return_value=True)
+
+    entity = ControlOnline(0, system_coordinator_mock)
+
+    assert entity.available is False
+    assert entity.is_on is False
+    assert entity.name == "Test home System Connection Status"
+    assert entity.extra_state_attributes["connection_status_fetched"] is False
