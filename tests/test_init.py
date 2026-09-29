@@ -134,17 +134,19 @@ async def test_async_setup_retries_failed_first_system_refresh(
     api.aiohttp_session.close.assert_awaited_once()
 
 
-async def test_async_setup_skips_api_while_persisted_quota_is_active(
+async def test_async_setup_uses_diagnostic_mode_while_persisted_quota_is_active(
     hass: HomeAssistant,
 ):
-    """A reload/restart must not make API calls during persisted quota backoff."""
+    """Persisted quota loads local diagnostics without calling Vaillant API."""
     config_entry = get_config_entry()
     quota_backoff = mock.MagicMock()
     quota_backoff.async_load = mock.AsyncMock()
     quota_backoff.is_active = True
-    quota_backoff.retry_message.return_value = "quota backoff active"
+    quota_backoff.remaining_seconds = 900
+    quota_backoff.until = None
 
     api_factory = mock.MagicMock()
+    cancel_reload = mock.MagicMock()
     with (
         mock.patch(
             "custom_components.mypyllant.QuotaBackoffStore",
@@ -154,9 +156,22 @@ async def test_async_setup_skips_api_while_persisted_quota_is_active(
             "custom_components.mypyllant.MyPyllantAPI",
             api_factory,
         ),
+        mock.patch(
+            "custom_components.mypyllant.async_call_later",
+            return_value=cancel_reload,
+        ) as schedule_reload,
+        mock.patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=mock.AsyncMock(),
+        ) as forward_setups,
     ):
-        with pytest.raises(ConfigEntryNotReady, match="quota backoff active"):
-            await async_setup_entry(hass, config_entry)
+        result = await async_setup_entry(hass, config_entry)
 
+    assert result is True
     quota_backoff.async_load.assert_awaited_once()
     api_factory.assert_not_called()
+    schedule_reload.assert_called_once()
+    forward_setups.assert_awaited_once()
+    assert hass.data[DOMAIN][config_entry.entry_id]["diagnostic_only"] is True
+    assert hass.data[DOMAIN][config_entry.entry_id]["quota_reload_cancel"] is cancel_reload

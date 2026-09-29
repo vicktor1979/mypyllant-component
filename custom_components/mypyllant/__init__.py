@@ -12,9 +12,11 @@ from homeassistant.core import (
     SupportsResponse,
     ServiceCall,
     ServiceResponse,
+    callback,
 )
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import selector
+from homeassistant.helpers.event import async_call_later
 
 from myPyllant import export, report
 
@@ -56,6 +58,59 @@ PLATFORMS: list[Platform] = [
     Platform.SWITCH,
     Platform.WATER_HEATER,
 ]
+
+
+DIAGNOSTIC_PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+
+def _quota_reload_stagger(entry_id: str) -> int:
+    """Return a stable 0-14s stagger to avoid a post-quota request burst."""
+    return sum(entry_id.encode("utf-8")) % 15
+
+
+async def _async_setup_quota_diagnostics(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    quota_backoff: QuotaBackoffStore,
+) -> bool:
+    """Load local-only diagnostics while Vaillant API backoff is active."""
+    entry_data = hass.data[DOMAIN][entry.entry_id]
+    entry_data["diagnostic_only"] = True
+    entry_data["loaded_platforms"] = DIAGNOSTIC_PLATFORMS
+
+    # Wait until after the server-provided quota window and stagger multiple
+    # accounts deterministically. This avoids all config entries hitting the
+    # Vaillant API at the same second when a shared quota window expires.
+    delay = max(1, quota_backoff.remaining_seconds) + 2 + _quota_reload_stagger(
+        entry.entry_id
+    )
+
+    @callback
+    def _reload_after_quota(_now) -> None:
+        current = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        if current is None:
+            return
+        current["quota_reload_cancel"] = None
+        hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
+
+    entry_data["quota_reload_cancel"] = async_call_later(
+        hass, delay, _reload_after_quota
+    )
+
+    await hass.config_entries.async_forward_entry_setups(
+        entry, DIAGNOSTIC_PLATFORMS
+    )
+
+    until = quota_backoff.until
+    _LOGGER.info(
+        "myVAILLANT account %s is API-limited; loaded local diagnostics only. "
+        "No Vaillant API requests will be made during backoff. Automatic reload "
+        "scheduled in %ss%s",
+        entry.title,
+        delay,
+        f" (quota until {until.isoformat()})" if until is not None else "",
+    )
+    return True
 
 _DEVICE_DATA_BUCKET_RESOLUTION_OPTIONS = [
     selector.SelectOptionDict(value=v.value, label=v.value.title())
@@ -111,7 +166,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await quota_backoff.async_load()
     hass.data[DOMAIN][entry.entry_id]["quota_backoff"] = quota_backoff
     if quota_backoff.is_active:
-        raise ConfigEntryNotReady(quota_backoff.retry_message("config entry setup"))
+        return await _async_setup_quota_diagnostics(hass, entry, quota_backoff)
 
     _LOGGER.debug("Creating API and logging in with %s in realm %s", username, country)
     api = MyPyllantAPI(
@@ -126,9 +181,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if is_quota_exceeded_exception(e):
             await quota_backoff.async_set_from_exception(e)
             await api.aiohttp_session.close()
-            raise ConfigEntryNotReady(
-                quota_backoff.retry_message("login")
-            ) from e
+            return await _async_setup_quota_diagnostics(
+                hass, entry, quota_backoff
+            )
         await api.aiohttp_session.close()
         raise ConfigEntryNotReady(
             f"Temporary myVAILLANT HTTP error during login: {e}"
@@ -156,6 +211,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await system_coordinator.async_config_entry_first_refresh()
     except ConfigEntryNotReady:
         await api.aiohttp_session.close()
+        if quota_backoff.is_active:
+            return await _async_setup_quota_diagnostics(
+                hass, entry, quota_backoff
+            )
         raise
     hass.data[DOMAIN][entry.entry_id]["system_coordinator"] = system_coordinator
 
@@ -172,8 +231,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             username,
         )
         system_coordinator.update_interval = None
-        daily_data_coordinator = DailyDataCoordinator(hass, api, entry, None)
-        daily_data_coordinator.async_set_updated_data({})
+        loaded_platforms = DIAGNOSTIC_PLATFORMS
     else:
         daily_data_coordinator = DailyDataCoordinator(
             hass,
@@ -183,9 +241,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         _LOGGER.debug("Refreshing DailyDataCoordinator")
         await daily_data_coordinator.async_refresh()
-    hass.data[DOMAIN][entry.entry_id]["daily_data_coordinator"] = daily_data_coordinator
+        hass.data[DOMAIN][entry.entry_id][
+            "daily_data_coordinator"
+        ] = daily_data_coordinator
+        loaded_platforms = PLATFORMS
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    hass.data[DOMAIN][entry.entry_id]["loaded_platforms"] = loaded_platforms
+    await hass.config_entries.async_forward_entry_setups(entry, loaded_platforms)
 
     async def handle_export(call: ServiceCall) -> ServiceResponse:
         _LOGGER.debug("Exporting data with params %s", call.data)
@@ -265,14 +327,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+
+    cancel_reload = entry_data.get("quota_reload_cancel")
+    if cancel_reload is not None:
+        cancel_reload()
+        entry_data["quota_reload_cancel"] = None
+
+    loaded_platforms = entry_data.get("loaded_platforms", PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry, loaded_platforms
+    )
     if unload_ok:
-        await hass.data[DOMAIN][entry.entry_id][
-            "system_coordinator"
-        ].api.aiohttp_session.close()
-        await hass.data[DOMAIN][entry.entry_id][
-            "daily_data_coordinator"
-        ].api.aiohttp_session.close()
-        hass.data[DOMAIN].pop(entry.entry_id)
+        # Diagnostic-only quota mode has no API object. In normal mode both
+        # coordinators share the same API/session, so close each unique API once.
+        seen_api_ids: set[int] = set()
+        for key in ("system_coordinator", "daily_data_coordinator"):
+            coordinator = entry_data.get(key)
+            api = getattr(coordinator, "api", None)
+            if api is None or id(api) in seen_api_ids:
+                continue
+            seen_api_ids.add(id(api))
+            await api.aiohttp_session.close()
+
+        hass.data[DOMAIN].pop(entry.entry_id, None)
 
     return unload_ok

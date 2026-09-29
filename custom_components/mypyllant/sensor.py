@@ -32,7 +32,7 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 from myPyllant.models import (
@@ -61,7 +61,9 @@ async def create_system_sensors(
     hass: HomeAssistant, config: ConfigEntry
 ) -> EntityList[SensorEntity]:
     entry_data = hass.data[DOMAIN][config.entry_id]
-    system_coordinator: SystemCoordinator = entry_data["system_coordinator"]
+    system_coordinator: SystemCoordinator | None = entry_data.get(
+        "system_coordinator"
+    )
     quota_backoff: QuotaBackoffStore | None = entry_data.get("quota_backoff")
 
     # Account-level API health must exist even for a valid empty account.  It is
@@ -73,7 +75,7 @@ async def create_system_sensors(
         )
     )
 
-    if not system_coordinator.data:
+    if system_coordinator is None or not system_coordinator.data:
         _LOGGER.debug("No system data, only adding account API status sensor")
         return sensors
 
@@ -292,14 +294,15 @@ async def async_setup_entry(
     hass: HomeAssistant, config: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     async_add_entities(await create_system_sensors(hass, config))  # type: ignore
-    async_add_entities(await create_daily_data_sensors(hass, config))  # type: ignore
+    if "daily_data_coordinator" in hass.data[DOMAIN][config.entry_id]:
+        async_add_entities(await create_daily_data_sensors(hass, config))  # type: ignore
 
 
-class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
+class VaillantApiStatusSensor(SensorEntity):
     """Account-level Vaillant API status with Hungarian diagnostics."""
 
-    coordinator: SystemCoordinator
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_should_poll = False
 
     STATUS_CONNECTED = "Kapcsolódva"
     STATUS_RATE_LIMITED = "Korlátozva (API-korlát)"
@@ -310,12 +313,36 @@ class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
     def __init__(
         self,
         config: ConfigEntry,
-        coordinator: SystemCoordinator,
+        coordinator: SystemCoordinator | None,
         quota_backoff: QuotaBackoffStore | None,
     ) -> None:
-        super().__init__(coordinator)
         self.config = config
+        self.coordinator = coordinator
         self.quota_backoff = quota_backoff
+
+    async def async_added_to_hass(self) -> None:
+        """Update from coordinator events and refresh local countdown text."""
+        await super().async_added_to_hass()
+        if self.coordinator is not None:
+            self.async_on_remove(
+                self.coordinator.async_add_listener(self._handle_coordinator_update)
+            )
+        # Local timer only refreshes entity state/attributes; it never calls the
+        # Vaillant API. This keeps the remaining backoff time useful while the
+        # integration is in diagnostics-only mode.
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._handle_local_tick, timedelta(seconds=60)
+            )
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self.async_write_ha_state()
+
+    @callback
+    def _handle_local_tick(self, _now) -> None:
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
@@ -354,6 +381,8 @@ class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def _api_down_backoff_active(self) -> bool:
+        if self.coordinator is None:
+            return False
         hit_at = getattr(self.coordinator, "_quota_hit_time", None)
         exc = getattr(self.coordinator, "_quota_exc_info", None)
         if hit_at is None or exc is None:
@@ -372,6 +401,11 @@ class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
         if self.quota_backoff is not None and self.quota_backoff.is_active:
             return self.STATUS_RATE_LIMITED
         if self._api_down_backoff_active:
+            return self.STATUS_WAITING_RETRY
+        if self.coordinator is None:
+            # The account is deliberately loaded in local diagnostics-only mode
+            # while API access is paused. Once the backoff expires, a scheduled
+            # config-entry reload will restore the normal coordinator.
             return self.STATUS_WAITING_RETRY
         if self.coordinator.last_update_success:
             return self.STATUS_CONNECTED
@@ -396,7 +430,11 @@ class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
             original_error = quota_state.get("message")
             reason = "A Vaillant API túl sok kérést érzékelt"
         else:
-            last_exception = getattr(self.coordinator, "last_exception", None)
+            last_exception = (
+                getattr(self.coordinator, "last_exception", None)
+                if self.coordinator is not None
+                else None
+            )
             http_status, error_url, original_error = self._exception_details(
                 last_exception
             )
@@ -415,7 +453,11 @@ class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
                 retry_at = dt_util.as_local(until).isoformat()
             remaining_seconds = self.quota_backoff.remaining_seconds
         elif self._api_down_backoff_active:
-            hit_at = getattr(self.coordinator, "_quota_hit_time", None)
+            hit_at = (
+                getattr(self.coordinator, "_quota_hit_time", None)
+                if self.coordinator is not None
+                else None
+            )
             if hit_at is not None:
                 retry_at_dt = hit_at + timedelta(seconds=API_DOWN_PAUSE_INTERVAL)
                 retry_at = dt_util.as_local(retry_at_dt).isoformat()
@@ -432,8 +474,16 @@ class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
             "Újrapróbálkozás időpontja": retry_at,
             "Hátralévő idő (mp)": remaining_seconds,
             "API-korlát miatti várakozás": quota_active,
-            "Utolsó sikeres frissítés": self.coordinator.homes_last_refresh,
-            "Üres fiók": self.coordinator.empty_account,
+            "Utolsó sikeres frissítés": (
+                self.coordinator.homes_last_refresh
+                if self.coordinator is not None
+                else None
+            ),
+            "Üres fiók": (
+                self.coordinator.empty_account
+                if self.coordinator is not None
+                else False
+            ),
         }
 
 

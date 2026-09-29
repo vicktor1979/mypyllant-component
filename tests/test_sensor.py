@@ -89,6 +89,30 @@ def test_vaillant_api_status_sensor_uses_hungarian_diagnostics():
     assert "Utolsó sikeres frissítés" in sensor.extra_state_attributes
 
 
+def test_vaillant_api_status_sensor_exists_without_system_coordinator():
+    """Quota diagnostics remain available before the normal coordinator loads."""
+    config = MagicMock()
+    config.entry_id = "entry_1"
+    config.title = "kazan01@example.invalid"
+
+    quota = MagicMock()
+    quota.is_active = True
+    quota.state = {
+        "status": 429,
+        "url": "https://api.example.invalid/homes",
+        "message": "Rate limit is exceeded. Try again later.",
+    }
+    quota.until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    quota.remaining_seconds = 600
+
+    sensor = VaillantApiStatusSensor(config, None, quota)
+
+    assert sensor.native_value == "Korlátozva (API-korlát)"
+    assert sensor.available is True
+    assert sensor.extra_state_attributes["HTTP állapot"] == 429
+    assert sensor.extra_state_attributes["Hátralévő idő (mp)"] == 600
+
+
 def test_vaillant_api_status_sensor_reports_rate_limit_in_hungarian():
     """Persisted 429 backoff is surfaced as a Hungarian rate-limit state."""
     config = MagicMock()
