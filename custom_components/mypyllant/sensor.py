@@ -356,7 +356,7 @@ class VaillantApiStatusSensor(SensorEntity):
 
     @property
     def name(self) -> str:
-        return f"{self.config.title} Vaillant API állapot"
+        return "Vaillant API állapot"
 
     @staticmethod
     def _exception_details(
@@ -467,6 +467,7 @@ class VaillantApiStatusSensor(SensorEntity):
                 )
 
         return {
+            "Fiók": self.config.title,
             "HTTP állapot": http_status,
             "Hiba oka": reason,
             "Nyers hibaüzenet": original_error,

@@ -84,7 +84,8 @@ def test_vaillant_api_status_sensor_uses_hungarian_diagnostics():
     sensor = VaillantApiStatusSensor(config, coordinator, quota)
 
     assert sensor.native_value == "Kapcsolódva"
-    assert sensor.name.endswith("Vaillant API állapot")
+    assert sensor.name == "Vaillant API állapot"
+    assert sensor.extra_state_attributes["Fiók"] == "kazan01@example.invalid"
     assert "HTTP állapot" in sensor.extra_state_attributes
     assert "Utolsó sikeres frissítés" in sensor.extra_state_attributes
 
