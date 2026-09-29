@@ -287,7 +287,7 @@ class ControlError(SystemControlEntity):
 
     @property
     def name(self) -> str:
-        return f"{self.name_prefix} Trouble Codes"
+        return f"{self.name_prefix} Hibakódok"
 
     @property
     def unique_id(self) -> str:

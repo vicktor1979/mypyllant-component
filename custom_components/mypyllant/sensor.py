@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.recorder import get_instance
@@ -34,6 +34,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 from myPyllant.models import (
     Circuit,
     Device,
@@ -50,7 +51,8 @@ from custom_components.mypyllant.utils import (
 from myPyllant.utils import prepare_field_value_for_dict
 
 from . import DailyDataCoordinator, SystemCoordinator
-from .const import DOMAIN
+from .quota import QuotaBackoffStore
+from .const import API_DOWN_PAUSE_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,14 +60,23 @@ _LOGGER = logging.getLogger(__name__)
 async def create_system_sensors(
     hass: HomeAssistant, config: ConfigEntry
 ) -> EntityList[SensorEntity]:
-    system_coordinator: SystemCoordinator = hass.data[DOMAIN][config.entry_id][
-        "system_coordinator"
-    ]
-    if not system_coordinator.data:
-        _LOGGER.debug("No system data, skipping sensors")
-        return EntityList()
+    entry_data = hass.data[DOMAIN][config.entry_id]
+    system_coordinator: SystemCoordinator = entry_data["system_coordinator"]
+    quota_backoff: QuotaBackoffStore | None = entry_data.get("quota_backoff")
 
+    # Account-level API health must exist even for a valid empty account.  It is
+    # intentionally separate from the per-gateway API/online diagnostics.
     sensors: EntityList[SensorEntity] = EntityList()
+    sensors.append(
+        lambda: VaillantApiStatusSensor(
+            config, system_coordinator, quota_backoff
+        )
+    )
+
+    if not system_coordinator.data:
+        _LOGGER.debug("No system data, only adding account API status sensor")
+        return sensors
+
     _LOGGER.debug("Creating system sensors for %s", system_coordinator.data)
     sensors.append(lambda: SystemAPIRequestCount(system_coordinator))
     for index, system in enumerate(system_coordinator.data):
@@ -282,6 +293,148 @@ async def async_setup_entry(
 ) -> None:
     async_add_entities(await create_system_sensors(hass, config))  # type: ignore
     async_add_entities(await create_daily_data_sensors(hass, config))  # type: ignore
+
+
+class VaillantApiStatusSensor(CoordinatorEntity, SensorEntity):
+    """Account-level Vaillant API status with Hungarian diagnostics."""
+
+    coordinator: SystemCoordinator
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    STATUS_CONNECTED = "Kapcsolódva"
+    STATUS_RATE_LIMITED = "Korlátozva (API-korlát)"
+    STATUS_WAITING_RETRY = "Várakozás az újrapróbálkozásra"
+    STATUS_API_ERROR = "API hiba"
+    STATUS_UNKNOWN = "Ismeretlen"
+
+    def __init__(
+        self,
+        config: ConfigEntry,
+        coordinator: SystemCoordinator,
+        quota_backoff: QuotaBackoffStore | None,
+    ) -> None:
+        super().__init__(coordinator)
+        self.config = config
+        self.quota_backoff = quota_backoff
+
+    @property
+    def available(self) -> bool:
+        # Keep the diagnostic entity visible when the coordinator itself fails;
+        # its purpose is to explain exactly that failure.
+        return True
+
+    @property
+    def unique_id(self) -> str:
+        return f"{DOMAIN}_{self.config.entry_id}_api_status"
+
+    @property
+    def name(self) -> str:
+        return f"{self.config.title} Vaillant API állapot"
+
+    @staticmethod
+    def _exception_details(
+        exc: BaseException | None,
+    ) -> tuple[int | None, str | None, str | None]:
+        """Find HTTP status, URL and original message through wrapped exceptions."""
+        current = exc
+        for _ in range(6):
+            if current is None:
+                break
+            status = getattr(current, "status", None)
+            request_info = getattr(current, "request_info", None)
+            real_url = getattr(request_info, "real_url", None)
+            if isinstance(status, int) or real_url is not None:
+                return (
+                    status if isinstance(status, int) else None,
+                    str(real_url) if real_url is not None else None,
+                    str(current),
+                )
+            current = current.__cause__ or current.__context__
+        return None, None, str(exc) if exc is not None else None
+
+    @property
+    def _api_down_backoff_active(self) -> bool:
+        hit_at = getattr(self.coordinator, "_quota_hit_time", None)
+        exc = getattr(self.coordinator, "_quota_exc_info", None)
+        if hit_at is None or exc is None:
+            return False
+        # Quota/rate-limit backoff is handled by the persistent store and has a
+        # separate, clearer state.  This branch is for temporary API/network
+        # outages only.
+        status = getattr(exc, "status", None)
+        if status == 429:
+            return False
+        elapsed = (datetime.now(timezone.utc) - hit_at).total_seconds()
+        return elapsed < API_DOWN_PAUSE_INTERVAL
+
+    @property
+    def native_value(self) -> str:
+        if self.quota_backoff is not None and self.quota_backoff.is_active:
+            return self.STATUS_RATE_LIMITED
+        if self._api_down_backoff_active:
+            return self.STATUS_WAITING_RETRY
+        if self.coordinator.last_update_success:
+            return self.STATUS_CONNECTED
+        if getattr(self.coordinator, "last_exception", None) is not None:
+            return self.STATUS_API_ERROR
+        return self.STATUS_UNKNOWN
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any]:
+        quota_state = (
+            self.quota_backoff.state
+            if self.quota_backoff is not None
+            else None
+        )
+        quota_active = bool(
+            self.quota_backoff is not None and self.quota_backoff.is_active
+        )
+
+        if quota_active and quota_state is not None:
+            http_status = quota_state.get("status")
+            error_url = quota_state.get("url")
+            original_error = quota_state.get("message")
+            reason = "A Vaillant API túl sok kérést érzékelt"
+        else:
+            last_exception = getattr(self.coordinator, "last_exception", None)
+            http_status, error_url, original_error = self._exception_details(
+                last_exception
+            )
+            if self.native_value == self.STATUS_WAITING_RETRY:
+                reason = "Átmeneti API- vagy hálózati hiba"
+            elif self.native_value == self.STATUS_API_ERROR:
+                reason = "A Vaillant API frissítése sikertelen"
+            else:
+                reason = None
+
+        retry_at = None
+        remaining_seconds = 0
+        if self.quota_backoff is not None and self.quota_backoff.is_active:
+            until = self.quota_backoff.until
+            if until is not None:
+                retry_at = dt_util.as_local(until).isoformat()
+            remaining_seconds = self.quota_backoff.remaining_seconds
+        elif self._api_down_backoff_active:
+            hit_at = getattr(self.coordinator, "_quota_hit_time", None)
+            if hit_at is not None:
+                retry_at_dt = hit_at + timedelta(seconds=API_DOWN_PAUSE_INTERVAL)
+                retry_at = dt_util.as_local(retry_at_dt).isoformat()
+                remaining_seconds = max(
+                    0,
+                    int((retry_at_dt - datetime.now(timezone.utc)).total_seconds()),
+                )
+
+        return {
+            "HTTP állapot": http_status,
+            "Hiba oka": reason,
+            "Nyers hibaüzenet": original_error,
+            "Utolsó hibás végpont": error_url,
+            "Újrapróbálkozás időpontja": retry_at,
+            "Hátralévő idő (mp)": remaining_seconds,
+            "API-korlát miatti várakozás": quota_active,
+            "Utolsó sikeres frissítés": self.coordinator.homes_last_refresh,
+            "Üres fiók": self.coordinator.empty_account,
+        }
 
 
 class SystemSensor(SystemCoordinatorEntity, SensorEntity):

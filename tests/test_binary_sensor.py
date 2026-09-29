@@ -93,6 +93,7 @@ async def test_control_error(
         )
         control_error = ControlError(0, system_coordinator_mock)
         assert control_error.is_on
+        assert control_error.name.endswith("Hibakódok")
         await mocked_api.aiohttp_session.close()
 
 

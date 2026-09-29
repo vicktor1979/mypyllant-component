@@ -37,6 +37,7 @@ from custom_components.mypyllant.sensor import (
     SystemTopCHTemperatureSensor,
     SystemDeviceCurrentPowerSensor,
     SystemAPIRequestCount,
+    VaillantApiStatusSensor,
 )
 from custom_components.mypyllant.const import DOMAIN
 from tests.utils import get_config_entry
@@ -60,6 +61,65 @@ def test_api_request_count_unique_id_is_config_entry_specific(hass):
     assert sensor_1.unique_id == f"{DOMAIN}_entry_1_api_request_count"
     assert sensor_2.unique_id == f"{DOMAIN}_entry_2_api_request_count"
     assert sensor_1.unique_id != sensor_2.unique_id
+
+
+def test_vaillant_api_status_sensor_uses_hungarian_diagnostics():
+    """Account API diagnostic state and attributes are presented in Hungarian."""
+    config = MagicMock()
+    config.entry_id = "entry_1"
+    config.title = "kazan01@example.invalid"
+
+    coordinator = MagicMock()
+    coordinator.last_update_success = True
+    coordinator.last_exception = None
+    coordinator.homes_last_refresh = "2026-09-29T06:00:00+00:00"
+    coordinator.empty_account = False
+    coordinator._quota_hit_time = None
+    coordinator._quota_exc_info = None
+
+    quota = MagicMock()
+    quota.is_active = False
+    quota.state = None
+
+    sensor = VaillantApiStatusSensor(config, coordinator, quota)
+
+    assert sensor.native_value == "Kapcsolódva"
+    assert sensor.name.endswith("Vaillant API állapot")
+    assert "HTTP állapot" in sensor.extra_state_attributes
+    assert "Utolsó sikeres frissítés" in sensor.extra_state_attributes
+
+
+def test_vaillant_api_status_sensor_reports_rate_limit_in_hungarian():
+    """Persisted 429 backoff is surfaced as a Hungarian rate-limit state."""
+    config = MagicMock()
+    config.entry_id = "entry_1"
+    config.title = "kazan01@example.invalid"
+
+    coordinator = MagicMock()
+    coordinator.last_update_success = False
+    coordinator.last_exception = None
+    coordinator.homes_last_refresh = None
+    coordinator.empty_account = False
+    coordinator._quota_hit_time = None
+    coordinator._quota_exc_info = None
+
+    quota = MagicMock()
+    quota.is_active = True
+    quota.state = {
+        "status": 429,
+        "url": "https://api.example.invalid/homes",
+        "message": "Rate limit is exceeded. Try again in 42 seconds.",
+    }
+    quota.until = datetime.now(timezone.utc) + timedelta(seconds=42)
+    quota.remaining_seconds = 42
+
+    sensor = VaillantApiStatusSensor(config, coordinator, quota)
+    attrs = sensor.extra_state_attributes
+
+    assert sensor.native_value == "Korlátozva (API-korlát)"
+    assert attrs["HTTP állapot"] == 429
+    assert attrs["Hiba oka"] == "A Vaillant API túl sok kérést érzékelt"
+    assert attrs["API-korlát miatti várakozás"] is True
 
 
 @pytest.mark.parametrize("test_data", list_test_data(only_with_systems=True))
