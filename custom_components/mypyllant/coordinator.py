@@ -8,8 +8,9 @@ from typing import TypedDict
 
 from aiohttp import ClientResponseError
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.mypyllant.const import (
@@ -88,6 +89,54 @@ class MyPyllantCoordinator(DataUpdateCoordinator):
         await quota_backoff.async_load()
         if quota_backoff.is_active:
             raise UpdateFailed(quota_backoff.retry_message(self.__class__.__name__))
+
+        # A store object stays alive for the lifetime of a loaded config entry.
+        # Once its deadline passes, async_load() is no longer called on a new
+        # instance, so an expired state could otherwise remain in memory and be
+        # preferred by diagnostic entities over a newer quota response.
+        if quota_backoff.state is not None:
+            await quota_backoff.async_clear()
+
+    def _schedule_runtime_quota_reload(self) -> None:
+        """Schedule one config-entry reload after a runtime quota window."""
+        # During initial setup loaded_platforms is not present yet. Setup-time
+        # quota handling already schedules its own diagnostics-only reload in
+        # __init__.py, so only add this timer for an already loaded entry.
+        if not self.hass_data.get("loaded_platforms"):
+            return
+
+        quota_backoff = self.quota_backoff
+        if quota_backoff is None or not quota_backoff.is_active:
+            return
+
+        existing = self.hass_data.get("quota_reload_cancel")
+        if existing is not None:
+            existing()
+
+        # Leave a small safety margin after Vaillant's advertised reset time,
+        # plus a stable per-entry stagger so several accounts do not all retry
+        # in the same second.
+        stagger = sum(self.entry.entry_id.encode("utf-8")) % 15
+        delay = max(1, quota_backoff.remaining_seconds) + 2 + stagger
+
+        @callback
+        def _reload_after_runtime_quota(_now) -> None:
+            current = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
+            if current is None:
+                return
+            current["quota_reload_cancel"] = None
+            self.hass.async_create_task(
+                self.hass.config_entries.async_reload(self.entry.entry_id)
+            )
+
+        self.hass_data["quota_reload_cancel"] = async_call_later(
+            self.hass, delay, _reload_after_runtime_quota
+        )
+        _LOGGER.info(
+            "myVAILLANT runtime quota hit for %s; automatic reload scheduled in %ss",
+            self.entry.title,
+            delay,
+        )
 
     @property
     def _quota_hit_time(self) -> dt | None:
@@ -206,6 +255,7 @@ class MyPyllantCoordinator(DataUpdateCoordinator):
             self._quota_exc_info = exc_info
             if self.quota_backoff is not None:
                 await self.quota_backoff.async_set_from_exception(exc_info)
+                self._schedule_runtime_quota_reload()
             self._raise_if_quota_hit()
 
     def _raise_if_quota_hit(self) -> None:

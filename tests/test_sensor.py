@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from homeassistant.components.recorder.statistics import StatisticMeanType
 from homeassistant.helpers.entity_registry import DATA_REGISTRY, EntityRegistry
 from homeassistant.loader import DATA_COMPONENTS, DATA_INTEGRATIONS
+from homeassistant.util.dt import parse_datetime as as_datetime
 
 from myPyllant.api import MyPyllantAPI
 from myPyllant.models import DeviceData, DeviceDataBucket
@@ -1011,3 +1012,54 @@ def test_today_total_consumption_all_none_values(hass):
         mock_datetime.now.return_value = _MIDNIGHT + timedelta(hours=1)
         sensor = _make_sensor(hass, buckets)
         assert sensor.today_total_consumption == 0.0
+
+
+def test_vaillant_api_status_prefers_new_live_quota_over_expired_store():
+    """A new 403 retry window must replace an older expired persisted timestamp."""
+    from aiohttp import ClientResponseError
+
+    config = MagicMock()
+    config.entry_id = "entry_1"
+    config.title = "kazan01@example.invalid"
+
+    request_info = MagicMock()
+    request_info.real_url = "https://api.example.invalid/homes"
+    exc = ClientResponseError(
+        request_info=request_info,
+        history=(),
+        status=403,
+        message=(
+            'Quota Exceeded, response was: { "statusCode": 403, '
+            '"message": "Out of call volume quota. '
+            'Quota will be replenished in 00:02:36." }'
+        ),
+        headers={},
+    )
+
+    now = datetime.now(timezone.utc)
+    coordinator = MagicMock()
+    coordinator.last_update_success = False
+    coordinator.last_exception = exc
+    coordinator.homes_last_refresh = "2026-09-29T13:47:22+00:00"
+    coordinator.empty_account = False
+    coordinator._quota_hit_time = now
+    coordinator._quota_end_time = now + timedelta(minutes=2, seconds=36)
+    coordinator._quota_exc_info = exc
+
+    quota = MagicMock()
+    quota.is_active = False
+    quota.state = {
+        "status": 403,
+        "url": "https://api.example.invalid/homes",
+        "message": "old quota",
+    }
+    quota.until = now - timedelta(seconds=1)
+
+    sensor = VaillantApiStatusSensor(config, coordinator, quota)
+    attrs = sensor.extra_state_attributes
+
+    retry = as_datetime(attrs["Újrapróbálkozás időpontja"])
+    assert retry is not None
+    assert retry > now + timedelta(minutes=2)
+    assert attrs["Hátralévő idő (mp)"] > 140
+    assert attrs["API-korlát miatti várakozás"] is True

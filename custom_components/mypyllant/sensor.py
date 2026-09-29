@@ -410,27 +410,32 @@ class VaillantApiStatusSensor(SensorEntity):
 
     @property
     def _quota_retry_at(self) -> datetime | None:
-        """Return the server-provided quota replenishment time when known."""
-        if self.quota_backoff is not None:
+        """Return the most recent server-provided quota replenishment time."""
+        # Prefer the live coordinator quota state. A config entry may hit a new
+        # short quota window immediately after an older persisted window ends;
+        # in that case the older store timestamp must not mask the new response.
+        if self.coordinator is not None:
+            quota_exc = self._quota_exception
+            end_time = getattr(self.coordinator, "_quota_end_time", None)
+            if quota_exc is not None and isinstance(end_time, datetime):
+                return end_time.astimezone(timezone.utc)
+
+            hit_at = getattr(self.coordinator, "_quota_hit_time", None)
+            if isinstance(hit_at, datetime) and quota_exc is not None:
+                duration = extract_quota_duration(quota_exc)
+                if duration is not None:
+                    return hit_at.astimezone(timezone.utc) + timedelta(
+                        seconds=duration
+                    )
+
+        # Diagnostics-only mode has no coordinator, so use the persisted store
+        # while it is actually active. Ignore expired store timestamps.
+        if self.quota_backoff is not None and self.quota_backoff.is_active:
             until = self.quota_backoff.until
             if isinstance(until, datetime):
                 return until.astimezone(timezone.utc)
 
-        if self.coordinator is None:
-            return None
-
-        end_time = getattr(self.coordinator, "_quota_end_time", None)
-        if isinstance(end_time, datetime):
-            return end_time.astimezone(timezone.utc)
-
-        hit_at = getattr(self.coordinator, "_quota_hit_time", None)
-        quota_exc = self._quota_exception
-        if not isinstance(hit_at, datetime) or quota_exc is None:
-            return None
-        duration = extract_quota_duration(quota_exc)
-        if duration is None:
-            return None
-        return hit_at.astimezone(timezone.utc) + timedelta(seconds=duration)
+        return None
 
     @property
     def _api_down_backoff_active(self) -> bool:

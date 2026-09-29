@@ -12,6 +12,7 @@ from myPyllant.api import MyPyllantAPI
 from myPyllant.tests.utils import list_test_data
 
 from custom_components.mypyllant.const import (
+    DOMAIN,
     API_DOWN_PAUSE_INTERVAL,
     QUOTA_PAUSE_INTERVAL,
 )
@@ -444,3 +445,31 @@ async def test_rate_limit_duration_from_try_again_minutes():
         message="Rate limit is exceeded. Try again in 2 minutes.",
     )
     assert extract_quota_duration(exc) == 120
+
+
+def test_runtime_quota_schedules_reload(system_coordinator_mock, monkeypatch):
+    """A runtime quota hit schedules one automatic config-entry reload."""
+    from unittest.mock import MagicMock
+
+    coordinator = system_coordinator_mock
+    coordinator.hass.data[DOMAIN][coordinator.entry.entry_id]["loaded_platforms"] = [
+        "sensor"
+    ]
+
+    quota = MagicMock()
+    quota.is_active = True
+    quota.remaining_seconds = 156
+    coordinator.hass.data[DOMAIN][coordinator.entry.entry_id]["quota_backoff"] = quota
+
+    cancel = MagicMock()
+    schedule = MagicMock(return_value=cancel)
+    monkeypatch.setattr(
+        "custom_components.mypyllant.coordinator.async_call_later", schedule
+    )
+
+    coordinator._schedule_runtime_quota_reload()
+
+    schedule.assert_called_once()
+    assert coordinator.hass.data[DOMAIN][coordinator.entry.entry_id][
+        "quota_reload_cancel"
+    ] is cancel
