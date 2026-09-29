@@ -47,6 +47,8 @@ from custom_components.mypyllant.utils import (
     DomesticHotWaterCoordinatorEntity,
     ZoneCoordinatorEntity,
     EntityList,
+    extract_quota_duration,
+    is_quota_exceeded_exception,
 )
 from myPyllant.utils import prepare_field_value_for_dict
 
@@ -379,6 +381,57 @@ class VaillantApiStatusSensor(SensorEntity):
             current = current.__cause__ or current.__context__
         return None, None, str(exc) if exc is not None else None
 
+    @staticmethod
+    def _find_quota_exception(exc: BaseException | None) -> BaseException | None:
+        """Return the wrapped Vaillant quota exception, if present."""
+        current = exc
+        for _ in range(6):
+            if current is None:
+                break
+            if is_quota_exceeded_exception(current):
+                return current
+            current = current.__cause__ or current.__context__
+        return None
+
+    @property
+    def _quota_exception(self) -> BaseException | None:
+        if self.coordinator is None:
+            return None
+        # Prefer the coordinator's dedicated quota exception.  Fall back to
+        # last_exception because Home Assistant may keep the failed refresh
+        # exception after the server-provided backoff window itself has ended.
+        exc = getattr(self.coordinator, "_quota_exc_info", None)
+        found = self._find_quota_exception(exc)
+        if found is not None:
+            return found
+        return self._find_quota_exception(
+            getattr(self.coordinator, "last_exception", None)
+        )
+
+    @property
+    def _quota_retry_at(self) -> datetime | None:
+        """Return the server-provided quota replenishment time when known."""
+        if self.quota_backoff is not None:
+            until = self.quota_backoff.until
+            if isinstance(until, datetime):
+                return until.astimezone(timezone.utc)
+
+        if self.coordinator is None:
+            return None
+
+        end_time = getattr(self.coordinator, "_quota_end_time", None)
+        if isinstance(end_time, datetime):
+            return end_time.astimezone(timezone.utc)
+
+        hit_at = getattr(self.coordinator, "_quota_hit_time", None)
+        quota_exc = self._quota_exception
+        if not isinstance(hit_at, datetime) or quota_exc is None:
+            return None
+        duration = extract_quota_duration(quota_exc)
+        if duration is None:
+            return None
+        return hit_at.astimezone(timezone.utc) + timedelta(seconds=duration)
+
     @property
     def _api_down_backoff_active(self) -> bool:
         if self.coordinator is None:
@@ -387,11 +440,10 @@ class VaillantApiStatusSensor(SensorEntity):
         exc = getattr(self.coordinator, "_quota_exc_info", None)
         if hit_at is None or exc is None:
             return False
-        # Quota/rate-limit backoff is handled by the persistent store and has a
-        # separate, clearer state.  This branch is for temporary API/network
-        # outages only.
-        status = getattr(exc, "status", None)
-        if status == 429:
+        # Quota/rate-limit backoff is handled separately.  This branch is only
+        # for temporary API/network outages, regardless of whether Vaillant
+        # returned quota as HTTP 403 or 429.
+        if self._find_quota_exception(exc) is not None:
             return False
         elapsed = (datetime.now(timezone.utc) - hit_at).total_seconds()
         return elapsed < API_DOWN_PAUSE_INTERVAL
@@ -399,6 +451,13 @@ class VaillantApiStatusSensor(SensorEntity):
     @property
     def native_value(self) -> str:
         if self.quota_backoff is not None and self.quota_backoff.is_active:
+            return self.STATUS_RATE_LIMITED
+        quota_retry_at = self._quota_retry_at
+        if (
+            self._quota_exception is not None
+            and quota_retry_at is not None
+            and datetime.now(timezone.utc) < quota_retry_at
+        ):
             return self.STATUS_RATE_LIMITED
         if self._api_down_backoff_active:
             return self.STATUS_WAITING_RETRY
@@ -420,14 +479,24 @@ class VaillantApiStatusSensor(SensorEntity):
             if self.quota_backoff is not None
             else None
         )
-        quota_active = bool(
+        quota_store_active = bool(
             self.quota_backoff is not None and self.quota_backoff.is_active
         )
+        quota_exc = self._quota_exception
+        quota_retry_at = self._quota_retry_at
+        quota_window_active = bool(
+            quota_retry_at is not None
+            and datetime.now(timezone.utc) < quota_retry_at
+            and (quota_store_active or quota_exc is not None)
+        )
 
-        if quota_active and quota_state is not None:
+        if quota_store_active and quota_state is not None:
             http_status = quota_state.get("status")
             error_url = quota_state.get("url")
             original_error = quota_state.get("message")
+            reason = "A Vaillant API túl sok kérést érzékelt"
+        elif quota_exc is not None:
+            http_status, error_url, original_error = self._exception_details(quota_exc)
             reason = "A Vaillant API túl sok kérést érzékelt"
         else:
             last_exception = (
@@ -447,11 +516,12 @@ class VaillantApiStatusSensor(SensorEntity):
 
         retry_at = None
         remaining_seconds = 0
-        if self.quota_backoff is not None and self.quota_backoff.is_active:
-            until = self.quota_backoff.until
-            if until is not None:
-                retry_at = dt_util.as_local(until).isoformat()
-            remaining_seconds = self.quota_backoff.remaining_seconds
+        if quota_retry_at is not None and (quota_state is not None or quota_exc is not None):
+            retry_at = dt_util.as_local(quota_retry_at).isoformat()
+            remaining_seconds = max(
+                0,
+                int((quota_retry_at - datetime.now(timezone.utc)).total_seconds()),
+            )
         elif self._api_down_backoff_active:
             hit_at = (
                 getattr(self.coordinator, "_quota_hit_time", None)
@@ -474,7 +544,7 @@ class VaillantApiStatusSensor(SensorEntity):
             "Utolsó hibás végpont": error_url,
             "Újrapróbálkozás időpontja": retry_at,
             "Hátralévő idő (mp)": remaining_seconds,
-            "API-korlát miatti várakozás": quota_active,
+            "API-korlát miatti várakozás": quota_window_active,
             "Utolsó sikeres frissítés": (
                 self.coordinator.homes_last_refresh
                 if self.coordinator is not None
@@ -486,6 +556,7 @@ class VaillantApiStatusSensor(SensorEntity):
                 else False
             ),
         }
+
 
 
 class SystemSensor(SystemCoordinatorEntity, SensorEntity):

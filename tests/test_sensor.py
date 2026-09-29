@@ -147,6 +147,100 @@ def test_vaillant_api_status_sensor_reports_rate_limit_in_hungarian():
     assert attrs["API-korlát miatti várakozás"] is True
 
 
+def test_vaillant_api_status_sensor_extracts_403_quota_retry_time():
+    """403 quota responses expose the server-provided replenishment time."""
+    from aiohttp import ClientResponseError
+
+    config = MagicMock()
+    config.entry_id = "entry_1"
+    config.title = "kazan01@example.invalid"
+
+    request_info = MagicMock()
+    request_info.real_url = "https://api.example.invalid/homes"
+    exc = ClientResponseError(
+        request_info=request_info,
+        history=(),
+        status=403,
+        message=(
+            'Quota Exceeded, response was: { "statusCode": 403, '
+            '"message": "Out of call volume quota. '
+            'Quota will be replenished in 00:08:54." }'
+        ),
+        headers={},
+    )
+
+    hit_at = datetime.now(timezone.utc)
+    coordinator = MagicMock()
+    coordinator.last_update_success = False
+    coordinator.last_exception = exc
+    coordinator.homes_last_refresh = "2026-09-29T12:21:10+00:00"
+    coordinator.empty_account = False
+    coordinator._quota_hit_time = hit_at
+    coordinator._quota_end_time = hit_at + timedelta(minutes=8, seconds=54)
+    coordinator._quota_exc_info = exc
+
+    quota = MagicMock()
+    quota.is_active = False
+    quota.state = None
+    quota.until = None
+
+    sensor = VaillantApiStatusSensor(config, coordinator, quota)
+    attrs = sensor.extra_state_attributes
+
+    assert sensor.native_value == "Korlátozva (API-korlát)"
+    assert attrs["HTTP állapot"] == 403
+    assert attrs["Hiba oka"] == "A Vaillant API túl sok kérést érzékelt"
+    assert attrs["Újrapróbálkozás időpontja"] is not None
+    assert 530 <= attrs["Hátralévő idő (mp)"] <= 534
+    assert attrs["API-korlát miatti várakozás"] is True
+
+
+def test_vaillant_api_status_sensor_keeps_403_retry_timestamp_after_window():
+    """The parsed quota replenishment timestamp remains visible after expiry."""
+    from aiohttp import ClientResponseError
+
+    config = MagicMock()
+    config.entry_id = "entry_1"
+    config.title = "kazan01@example.invalid"
+
+    request_info = MagicMock()
+    request_info.real_url = "https://api.example.invalid/homes"
+    exc = ClientResponseError(
+        request_info=request_info,
+        history=(),
+        status=403,
+        message=(
+            'Quota Exceeded, response was: { "statusCode": 403, '
+            '"message": "Out of call volume quota. '
+            'Quota will be replenished in 00:08:54." }'
+        ),
+        headers={},
+    )
+
+    hit_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    coordinator = MagicMock()
+    coordinator.last_update_success = False
+    coordinator.last_exception = exc
+    coordinator.homes_last_refresh = "2026-09-29T12:21:10+00:00"
+    coordinator.empty_account = False
+    coordinator._quota_hit_time = hit_at
+    coordinator._quota_end_time = hit_at + timedelta(minutes=8, seconds=54)
+    coordinator._quota_exc_info = exc
+
+    quota = MagicMock()
+    quota.is_active = False
+    quota.state = None
+    quota.until = None
+
+    sensor = VaillantApiStatusSensor(config, coordinator, quota)
+    attrs = sensor.extra_state_attributes
+
+    assert attrs["HTTP állapot"] == 403
+    assert attrs["Újrapróbálkozás időpontja"] is not None
+    assert attrs["Hátralévő idő (mp)"] == 0
+    assert attrs["API-korlát miatti várakozás"] is False
+
+
 @pytest.mark.parametrize("test_data", list_test_data(only_with_systems=True))
 async def test_create_system_sensors(
     hass,
