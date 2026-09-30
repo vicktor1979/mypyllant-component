@@ -3,6 +3,11 @@ from myPyllant.enums import ZoneOperatingType
 DOMAIN = "mypyllant"
 OPTION_UPDATE_INTERVAL = "update_interval"
 OPTION_UPDATE_INTERVAL_DAILY = "update_interval_daily"
+OPTION_FETCH_ENERGY_HISTORY = "fetch_energy_history"
+# Opt-in: do not fetch consumption history, including at startup, by default.
+DEFAULT_FETCH_ENERGY_HISTORY = False
+# Local pacing policy, not an officially published Vaillant quota.
+API_REFRESH_GAP_SECONDS = 20.0
 OPTION_REFRESH_DELAY = "refresh_delay"
 OPTION_DEFAULT_QUICK_VETO_DURATION = "quick_veto_duration"
 OPTION_DEFAULT_HOLIDAY_DURATION = "holiday_duration"

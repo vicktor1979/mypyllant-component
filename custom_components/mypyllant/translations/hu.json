@@ -1,0 +1,14 @@
+{
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "fetch_energy_history": "Energiaelőzmények lekérése (induláskor és újratöltéskor is)"
+        },
+        "data_description": {
+          "fetch_energy_history": "Kikapcsolva egyáltalán nem kéri le a korábbi fogyasztási adatokat, induláskor sem. Az élő kazánadatok és a vezérlés megmaradnak. Módosításakor ez a fiók automatikusan újratöltődik. Alapértelmezés: kikapcsolva."
+        }
+      }
+    }
+  }
+}

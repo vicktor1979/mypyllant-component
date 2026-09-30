@@ -144,13 +144,18 @@ async def test_async_setup_uses_diagnostic_mode_while_persisted_quota_is_active(
     quota_backoff.is_active = True
     quota_backoff.remaining_seconds = 900
     quota_backoff.until = None
+    quota_backoff.state = None
+    energy_backoff = mock.MagicMock()
+    energy_backoff.async_load = mock.AsyncMock()
+    energy_backoff.state = None
+    energy_backoff.is_active = False
 
     api_factory = mock.MagicMock()
     cancel_reload = mock.MagicMock()
     with (
         mock.patch(
             "custom_components.mypyllant.QuotaBackoffStore",
-            return_value=quota_backoff,
+            side_effect=[quota_backoff, energy_backoff],
         ),
         mock.patch(
             "custom_components.mypyllant.MyPyllantAPI",

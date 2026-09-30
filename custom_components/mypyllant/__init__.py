@@ -14,7 +14,7 @@ from homeassistant.core import (
     ServiceResponse,
     callback,
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import selector
 from homeassistant.helpers.event import async_call_later
 
@@ -30,6 +30,8 @@ from myPyllant.http_client import (
 )
 from myPyllant.tests import generate_test_data
 from .const import (
+    DEFAULT_FETCH_ENERGY_HISTORY,
+    OPTION_FETCH_ENERGY_HISTORY,
     DEFAULT_COUNTRY,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
@@ -43,7 +45,8 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL_DAILY,
 )
 from .coordinator import SystemCoordinator, DailyDataCoordinator
-from .quota import QuotaBackoffStore
+from .quota import QuotaBackoffStore, async_migrate_energy_quota
+from .api_queue import get_api_refresh_queue
 from .utils import is_quota_exceeded_exception
 
 _LOGGER = logging.getLogger(__name__)
@@ -145,6 +148,16 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     return True
 
 
+async def _async_energy_option_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Apply the new history toggle automatically, also in diagnostics mode."""
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if entry_data is None:
+        return
+    enabled = entry.options.get(OPTION_FETCH_ENERGY_HISTORY, DEFAULT_FETCH_ENERGY_HISTORY)
+    if enabled != entry_data.get("energy_history_enabled"):
+        await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     username: str = entry.data.get("username")  # type: ignore
     password: str = entry.data.get("password")  # type: ignore
@@ -158,7 +171,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     brand = entry.options.get(OPTION_BRAND, entry.data.get(OPTION_BRAND, DEFAULT_BRAND))
 
     hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = {}
+    energy_enabled = entry.options.get(
+        OPTION_FETCH_ENERGY_HISTORY, DEFAULT_FETCH_ENERGY_HISTORY
+    )
+    hass.data[DOMAIN][entry.entry_id] = {"energy_history_enabled": energy_enabled}
+    entry.async_on_unload(entry.add_update_listener(_async_energy_option_updated))
 
     # Quota state is persisted per config entry, so a reload or Home Assistant
     # restart cannot accidentally bypass Vaillant's backoff window and burn
@@ -166,91 +183,136 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     quota_backoff = QuotaBackoffStore(hass, entry.entry_id)
     await quota_backoff.async_load()
     hass.data[DOMAIN][entry.entry_id]["quota_backoff"] = quota_backoff
+    energy_backoff = QuotaBackoffStore(hass, entry.entry_id, scope="energy")
+    await energy_backoff.async_load()
+    hass.data[DOMAIN][entry.entry_id]["energy_quota_backoff"] = energy_backoff
+    if await async_migrate_energy_quota(quota_backoff, energy_backoff):
+        _LOGGER.info(
+            "Moved a historical buckets quota to energy-only backoff for %s; "
+            "the server deadline is preserved, live data may be requested",
+            entry.title,
+        )
     if quota_backoff.is_active:
         return await _async_setup_quota_diagnostics(hass, entry, quota_backoff)
 
-    _LOGGER.debug("Creating API and logging in with %s in realm %s", username, country)
-    api = MyPyllantAPI(
-        username=username, password=password, brand=brand, country=country
-    )
-    try:
-        await api.login()
-    except (AuthenticationFailed, LoginEndpointInvalid, RealmInvalid) as e:
-        await api.aiohttp_session.close()
-        raise ConfigEntryAuthFailed from e
-    except ClientResponseError as e:
-        if is_quota_exceeded_exception(e):
-            await quota_backoff.async_set_from_exception(e)
+    # One batch covers login and initial system/history fetches. Nested
+    # coordinator refreshes use the same task-reentrant queue slot.
+    queue = get_api_refresh_queue(hass)
+    async with queue.slot(entry.entry_id, f"{entry.title}: initial setup"):
+        _LOGGER.debug("Creating API and logging in with %s in realm %s", username, country)
+        api = MyPyllantAPI(
+            username=username, password=password, brand=brand, country=country
+        )
+        try:
+            await api.login()
+        except (AuthenticationFailed, LoginEndpointInvalid, RealmInvalid) as e:
             await api.aiohttp_session.close()
-            return await _async_setup_quota_diagnostics(
-                hass, entry, quota_backoff
-            )
-        await api.aiohttp_session.close()
-        raise ConfigEntryNotReady(
-            f"Temporary myVAILLANT HTTP error during login: {e}"
-        ) from e
-    except (ClientError, TimeoutError, OSError) as e:
-        # Treat temporary login/network failures as a setup retry instead of a
-        # permanent failed setup.  This is especially important when several
-        # myVAILLANT config entries start at the same time after a HA restart.
-        await api.aiohttp_session.close()
-        raise ConfigEntryNotReady(
-            f"Temporary myVAILLANT login/network error: {e}"
-        ) from e
+            raise ConfigEntryAuthFailed from e
+        except ClientResponseError as e:
+            if is_quota_exceeded_exception(e):
+                await quota_backoff.async_set_from_exception(e)
+                await api.aiohttp_session.close()
+                return await _async_setup_quota_diagnostics(
+                    hass, entry, quota_backoff
+                )
+            await api.aiohttp_session.close()
+            raise ConfigEntryNotReady(
+                f"Temporary myVAILLANT HTTP error during login: {e}"
+            ) from e
+        except (ClientError, TimeoutError, OSError) as e:
+            # Treat temporary login/network failures as a setup retry instead of a
+            # permanent failed setup.  This is especially important when several
+            # myVAILLANT config entries start at the same time after a HA restart.
+            await api.aiohttp_session.close()
+            raise ConfigEntryNotReady(
+                f"Temporary myVAILLANT login/network error: {e}"
+            ) from e
+        except BaseException:
+            await api.aiohttp_session.close()
+            raise
 
-    system_coordinator = SystemCoordinator(
-        hass, api, entry, timedelta(seconds=update_interval)
-    )
-    _LOGGER.debug("Refreshing SystemCoordinator")
-    try:
-        # async_refresh() only records a failed first refresh and then setup
-        # continues, which can leave entity-registry entries as "not
-        # provided" until the user manually reloads the config entry.  The
-        # config-entry first-refresh helper raises ConfigEntryNotReady on a
-        # complete initial fetch failure, so Home Assistant retries setup
-        # automatically once the Vaillant API/gateway recovers.
-        await system_coordinator.async_config_entry_first_refresh()
-    except ConfigEntryNotReady:
-        await api.aiohttp_session.close()
-        if quota_backoff.is_active:
-            return await _async_setup_quota_diagnostics(
-                hass, entry, quota_backoff
-            )
-        raise
-    hass.data[DOMAIN][entry.entry_id]["system_coordinator"] = system_coordinator
+        system_coordinator = SystemCoordinator(
+            hass, api, entry, timedelta(seconds=update_interval)
+        )
+        _LOGGER.debug("Refreshing SystemCoordinator")
+        try:
+            # async_refresh() only records a failed first refresh and then setup
+            # continues, which can leave entity-registry entries as "not
+            # provided" until the user manually reloads the config entry.  The
+            # config-entry first-refresh helper raises ConfigEntryNotReady on a
+            # complete initial fetch failure, so Home Assistant retries setup
+            # automatically once the Vaillant API/gateway recovers.
+            await system_coordinator.async_config_entry_first_refresh()
+        except ConfigEntryNotReady:
+            await api.aiohttp_session.close()
+            if quota_backoff.is_active:
+                return await _async_setup_quota_diagnostics(
+                    hass, entry, quota_backoff
+                )
+            raise
+        except BaseException:
+            await api.aiohttp_session.close()
+            raise
+        hass.data[DOMAIN][entry.entry_id]["system_coordinator"] = system_coordinator
 
-    # Daily data coordinator is fetched once by default (to get all entities), but
-    # not updated on a regular basis
-    # to prevent quota errors.  A successfully authenticated account with no
-    # homes is valid; do not make any more API calls for it after the initial
-    # /homes check.  With no entities there are no coordinator listeners, and
-    # explicitly disabling the interval also prevents accidental future polls.
-    if system_coordinator.empty_account:
-        _LOGGER.info(
-            "myVAILLANT account %s contains no homes; disabling polling until "
-            "the config entry is reloaded",
-            username,
-        )
-        system_coordinator.update_interval = None
-        loaded_platforms = DIAGNOSTIC_PLATFORMS
-    else:
-        daily_data_coordinator = DailyDataCoordinator(
-            hass,
-            api,
-            entry,
-            timedelta(seconds=update_interval_daily) if update_interval_daily else None,
-        )
-        _LOGGER.debug("Refreshing DailyDataCoordinator")
-        await daily_data_coordinator.async_refresh()
-        hass.data[DOMAIN][entry.entry_id][
-            "daily_data_coordinator"
-        ] = daily_data_coordinator
-        loaded_platforms = PLATFORMS
+        # Daily data coordinator is fetched once by default (to get all entities), but
+        # not updated on a regular basis
+        # to prevent quota errors.  A successfully authenticated account with no
+        # homes is valid; do not make any more API calls for it after the initial
+        # /homes check.  With no entities there are no coordinator listeners, and
+        # explicitly disabling the interval also prevents accidental future polls.
+        if system_coordinator.empty_account:
+            _LOGGER.info(
+                "myVAILLANT account %s contains no homes; disabling polling until "
+                "the config entry is reloaded",
+                username,
+            )
+            system_coordinator.update_interval = None
+            loaded_platforms = DIAGNOSTIC_PLATFORMS
+        elif not energy_enabled:
+            _LOGGER.info(
+                "Energy history disabled for %s: no startup, reload or periodic buckets requests",
+                entry.title,
+            )
+            loaded_platforms = PLATFORMS
+        else:
+            daily_data_coordinator = DailyDataCoordinator(
+                hass,
+                api,
+                entry,
+                timedelta(seconds=update_interval_daily) if update_interval_daily else None,
+            )
+            hass.data[DOMAIN][entry.entry_id][
+                "daily_data_coordinator"
+            ] = daily_data_coordinator
+            _LOGGER.debug("Refreshing DailyDataCoordinator")
+            try:
+                await daily_data_coordinator.async_refresh()
+            except BaseException:
+                await api.aiohttp_session.close()
+                raise
+            loaded_platforms = PLATFORMS
 
     hass.data[DOMAIN][entry.entry_id]["loaded_platforms"] = loaded_platforms
     await hass.config_entries.async_forward_entry_setups(entry, loaded_platforms)
+    if quota_backoff.is_active:
+        # A token/account-wide error during the initial history refresh needs
+        # a timer too; platform setup had not yet been completed when it failed.
+        system_coordinator._schedule_runtime_quota_reload()
+
+    def _check_energy_history_access() -> None:
+        # Explicit report/test-data services must not bypass the opt-out or
+        # repeatedly query historical endpoints during a known energy quota.
+        if not entry.options.get(OPTION_FETCH_ENERGY_HISTORY, DEFAULT_FETCH_ENERGY_HISTORY):
+            raise HomeAssistantError("Az energiaelőzmények lekérése ki van kapcsolva.")
+        if energy_backoff.is_active:
+            raise HomeAssistantError(energy_backoff.retry_message("energy export"))
+        if quota_backoff.is_active:
+            raise HomeAssistantError(quota_backoff.retry_message("energy export"))
 
     async def handle_export(call: ServiceCall) -> ServiceResponse:
+        if call.data.get("data", False):
+            _check_energy_history_access()
         _LOGGER.debug("Exporting data with params %s", call.data)
         return {
             "export": await export.main(
@@ -266,6 +328,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         }
 
     async def handle_generate_test_data(call: ServiceCall) -> ServiceResponse:
+        _check_energy_history_access()
         return await generate_test_data.main(
             user=username,
             password=password,
@@ -275,6 +338,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     async def handle_report(call: ServiceCall) -> ServiceResponse:
+        _check_energy_history_access()
         return {
             f.file_name: f.file_content
             for f in await report.main(
@@ -335,6 +399,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cancel_reload()
         entry_data["quota_reload_cancel"] = None
 
+    cancel_energy_retry = entry_data.pop("energy_quota_retry_cancel", None)
+    if cancel_energy_retry is not None:
+        cancel_energy_retry()
+
     loaded_platforms = entry_data.get("loaded_platforms", PLATFORMS)
     unload_ok = await hass.config_entries.async_unload_platforms(
         entry, loaded_platforms
@@ -345,6 +413,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         seen_api_ids: set[int] = set()
         for key in ("system_coordinator", "daily_data_coordinator"):
             coordinator = entry_data.get(key)
+            if coordinator is not None:
+                await coordinator.async_shutdown()
             api = getattr(coordinator, "api", None)
             if api is None or id(api) in seen_api_ids:
                 continue

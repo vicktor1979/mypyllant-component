@@ -84,7 +84,11 @@
           "fetch_ambisense_capability": "Fetch Ambisense Capability",
           "fetch_ambisense_rooms": "Fetch Ambisense Room Thermostats",
           "fetch_energy_management": "Fetch Energy Management Data",
-          "fetch_eebus": "Fetch EEBUS Data"
+          "fetch_eebus": "Fetch EEBUS Data",
+          "fetch_energy_history": "Fetch energy history (also at startup and reload)"
+        },
+        "data_description": {
+          "fetch_energy_history": "Off: no historical consumption / buckets requests, even at startup. Live system data and controls remain enabled. Saving this checkbox reloads this account. Default: off."
         }
       }
     }

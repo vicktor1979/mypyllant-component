@@ -54,7 +54,11 @@ from myPyllant.utils import prepare_field_value_for_dict
 
 from . import DailyDataCoordinator, SystemCoordinator
 from .quota import QuotaBackoffStore
-from .const import API_DOWN_PAUSE_INTERVAL, DOMAIN
+from .const import (
+    API_DOWN_PAUSE_INTERVAL, DOMAIN,
+    OPTION_FETCH_ENERGY_HISTORY, DEFAULT_FETCH_ENERGY_HISTORY,
+)
+from .api_queue import get_api_refresh_queue
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -296,8 +300,30 @@ async def async_setup_entry(
     hass: HomeAssistant, config: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     async_add_entities(await create_system_sensors(hass, config))  # type: ignore
-    if "daily_data_coordinator" in hass.data[DOMAIN][config.entry_id]:
-        async_add_entities(await create_daily_data_sensors(hass, config))  # type: ignore
+    entry_data = hass.data[DOMAIN][config.entry_id]
+    daily = entry_data.get("daily_data_coordinator")
+    if daily is not None:
+        added: set[str] = set()
+
+        async def add_new_history_sensors() -> None:
+            if hass.data.get(DOMAIN, {}).get(config.entry_id) is not entry_data:
+                return
+            if not daily.last_update_success or not daily.data:
+                return
+            new_entities = []
+            for entity in await create_daily_data_sensors(hass, config):
+                if entity.unique_id not in added:
+                    added.add(entity.unique_id)
+                    new_entities.append(entity)
+            if new_entities:
+                async_add_entities(new_entities)
+
+        @callback
+        def history_updated() -> None:
+            hass.async_create_task(add_new_history_sensors())
+
+        config.async_on_unload(daily.async_add_listener(history_updated))
+        await add_new_history_sensors()
 
 
 class VaillantApiStatusSensor(SensorEntity):
@@ -541,8 +567,32 @@ class VaillantApiStatusSensor(SensorEntity):
                     int((retry_at_dt - datetime.now(timezone.utc)).total_seconds()),
                 )
 
+        entry_data = (
+            self.hass.data.get(DOMAIN, {}).get(self.config.entry_id, {})
+            if self.hass is not None else {}
+        )
+        energy_store = entry_data.get("energy_quota_backoff")
+        energy_state = energy_store.state if energy_store is not None else None
+        energy_active = bool(energy_store is not None and energy_store.is_active)
+        queue_state = (
+            get_api_refresh_queue(self.hass).status(self.config.entry_id)
+            if self.hass is not None else {"waiting": False, "active": False}
+        )
         return {
             "Fiók": self.config.title,
+            "Energiaelőzmények lekérése": self.config.options.get(
+                OPTION_FETCH_ENERGY_HISTORY, DEFAULT_FETCH_ENERGY_HISTORY
+            ),
+            "Energiaelőzmények API-korlátja": energy_active,
+            "Energiaelőzmények újrapróbálkozása": (
+                dt_util.as_local(energy_store.until).isoformat()
+                if energy_active else None
+            ),
+            "Energiaelőzmények hibája": (
+                energy_state.get("message") if energy_active and energy_state else None
+            ),
+            "API-frissítés sorban áll": queue_state["waiting"],
+            "API-frissítés folyamatban": queue_state["active"],
             "HTTP állapot": http_status,
             "Hiba oka": reason,
             "Nyers hibaüzenet": original_error,
