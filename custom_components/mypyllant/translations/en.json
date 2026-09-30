@@ -3,44 +3,46 @@
     "abort": {
       "entry_not_found": "No configuration entry was found for this user",
       "reauth_successful": "Reconfiguration was successful!",
-      "wrong_account": "The account you're trying to reconfigure is not the same as the one you logged in with"
+      "wrong_account": "The account you're trying to reconfigure is not the same as the one you logged in with",
+      "unknown_entry": "No configuration entry was found for this account.",
+      "reconfiguration_successful": "The account configuration was updated successfully."
     },
     "step": {
       "user": {
         "data": {
           "password": "Password",
-          "username": "Email Address",
+          "username": "Email address",
           "country": "Country",
           "brand": "Brand"
         },
         "title": "Login Information",
-        "description": "Same as myVAILLANT app"
+        "description": "Use the same account details as in the myVAILLANT app."
       },
       "reauth_confirm": {
         "data": {
           "password": "Password",
-          "username": "Username",
+          "username": "Email address",
           "country": "Country",
           "brand": "Brand"
         },
         "title": "Reauthenticate to myVAILLANT",
-        "description": "Same as myVAILLANT app"
+        "description": "Use the same account details as in the myVAILLANT app."
       },
       "reconfigure": {
         "data": {
           "password": "Password",
-          "username": "Username",
+          "username": "Email address",
           "country": "Country",
           "brand": "Brand"
         },
         "title": "Reconfigure myVAILLANT",
-        "description": "Same as myVAILLANT app"
+        "description": "Use the same account details as in the myVAILLANT app."
       }
     },
     "error": {
       "login_endpoint_invalid": "No login method was found for this combination of brand and country",
       "realm_invalid": "This brand requires a country to be selected",
-      "authentication_failed": "Authentication failed, check your username and password and make sure you selected the right country and device brand",
+      "authentication_failed": "Authentication failed. Check your email address and password, and make sure you selected the correct country and device brand.",
       "already_configured": "There's already a hub for this user configured",
       "another_user": "There's already a hub for this user configured",
       "unknown": "Unexpected error"
@@ -66,30 +68,37 @@
     "step": {
       "init": {
         "data": {
-          "update_interval": "Seconds between live data updates (lowering risks 'quota exceeded' errors and temporary bans)",
-          "update_interval_daily": "Seconds between energy data updates (lowering risks 'quota exceeded' errors and temporary bans)",
-          "refresh_delay": "Delay in seconds before refreshing data after updates",
-          "quick_veto_duration": "Default duration in hours for quick veto",
-          "holiday_duration": "Default duration in days for away mode",
-          "time_program_overwrite": "Temperature controls overwrite time program instead of setting quick veto",
-          "default_holiday_setpoint": "Default temperature setpoint for away mode",
-          "manual_cooling_duration": "Default duration for manual cooling in days",
-          "dhw_legionella_protection_temperature": "Temperature above which legionella protection is considered active",
+          "update_interval": "Live data update interval (seconds)",
+          "update_interval_daily": "Energy history update interval (seconds)",
+          "refresh_delay": "Refresh delay after a change (seconds)",
+          "quick_veto_duration": "Default quick veto duration (hours)",
+          "holiday_duration": "Default away mode duration (days)",
+          "time_program_overwrite": "Temperature controls overwrite the time program instead of setting quick veto",
+          "default_holiday_setpoint": "Default away mode temperature (°C)",
+          "manual_cooling_duration": "Default manual cooling duration (days)",
+          "dhw_legionella_protection_temperature": "Legionella protection indication threshold (°C)",
           "country": "Country",
           "brand": "Brand",
-          "fetch_rts": "Fetch real-time statistics (not supported on every system)",
-          "fetch_mpc": "Fetch real-time power usage (not supported on every system)",
+          "fetch_rts": "Fetch real-time statistics",
+          "fetch_mpc": "Fetch real-time power usage",
           "fetch_connection_status": "Fetch system connection status",
           "fetch_dtc": "Fetch diagnostic trouble codes",
-          "fetch_ambisense_capability": "Fetch Ambisense Capability",
-          "fetch_ambisense_rooms": "Fetch Ambisense Room Thermostats",
-          "fetch_energy_management": "Fetch Energy Management Data",
-          "fetch_eebus": "Fetch EEBUS Data",
+          "fetch_ambisense_capability": "Fetch ambiSENSE support information",
+          "fetch_ambisense_rooms": "Fetch ambiSENSE room thermostats",
+          "fetch_energy_management": "Fetch energy management data",
+          "fetch_eebus": "Fetch EEBUS data",
           "fetch_energy_history": "Fetch energy history (also at startup and reload)"
         },
         "data_description": {
-          "fetch_energy_history": "Off: no historical consumption / buckets requests, even at startup. Live system data and controls remain enabled. Saving this checkbox reloads this account. Default: off."
-        }
+          "update_interval": "A shorter interval increases API traffic and may cause quota errors or temporary restrictions.",
+          "fetch_energy_history": "Off by default. When disabled, historical consumption data is not requested at startup, on reload or periodically. Live system data and controls remain enabled. Changing this checkbox reloads only this account.",
+          "update_interval_daily": "Used only when energy history is enabled. A shorter interval increases API traffic and may cause quota errors. When left empty, periodic energy history updates are disabled; this alone does not disable the startup request.",
+          "fetch_rts": "Not supported by every system. This is separate from energy history.",
+          "fetch_mpc": "Not supported by every system. This is separate from energy history.",
+          "fetch_connection_status": "Uses a separate API request. Gateway Online does not require this option.",
+          "dhw_legionella_protection_temperature": "This is a diagnostic indication threshold, not a setting for the boiler disinfection program."
+        },
+        "title": "myVAILLANT options"
       }
     }
   }

@@ -1,12 +1,103 @@
 {
+  "config": {
+    "abort": {
+      "entry_not_found": "Nem található konfigurációs bejegyzés ehhez a fiókhoz.",
+      "reauth_successful": "Az újbóli hitelesítés sikerült.",
+      "wrong_account": "A megadott belépési adatok másik fiókhoz tartoznak, nem az újrakonfigurálni kívánt fiókhoz.",
+      "unknown_entry": "Nem található konfigurációs bejegyzés ehhez a fiókhoz.",
+      "reconfiguration_successful": "A fiók konfigurációjának módosítása sikerült."
+    },
+    "step": {
+      "user": {
+        "data": {
+          "password": "Jelszó",
+          "username": "E-mail-cím",
+          "country": "Ország",
+          "brand": "Márka"
+        },
+        "title": "Bejelentkezés a myVAILLANT-fiókba",
+        "description": "Add meg a myVAILLANT alkalmazásban használt fiók belépési adatait."
+      },
+      "reauth_confirm": {
+        "data": {
+          "password": "Jelszó",
+          "username": "E-mail-cím",
+          "country": "Ország",
+          "brand": "Márka"
+        },
+        "title": "A myVAILLANT-fiók újbóli hitelesítése",
+        "description": "Add meg a myVAILLANT alkalmazásban használt fiók belépési adatait."
+      },
+      "reconfigure": {
+        "data": {
+          "password": "Jelszó",
+          "username": "E-mail-cím",
+          "country": "Ország",
+          "brand": "Márka"
+        },
+        "title": "A myVAILLANT-fiók újrakonfigurálása",
+        "description": "Add meg a myVAILLANT alkalmazásban használt fiók belépési adatait."
+      }
+    },
+    "error": {
+      "login_endpoint_invalid": "A kiválasztott márkához és országhoz nem található bejelentkezési végpont.",
+      "realm_invalid": "Ehhez a márkához az országot is ki kell választani.",
+      "authentication_failed": "Sikertelen hitelesítés. Ellenőrizd az e-mail-címet, a jelszót, a kiválasztott országot és a készülék márkáját.",
+      "already_configured": "Ez a fiók már hozzá van adva az integrációhoz.",
+      "another_user": "Ez a fiók már hozzá van adva az integrációhoz.",
+      "unknown": "Váratlan hiba történt."
+    }
+  },
+  "entity": {
+    "climate": {
+      "mypyllant_zone": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "system_off": "Rendszer kikapcsolva",
+              "ventilation_boost": "Fokozott szellőztetés",
+              "boost": "Ideiglenes felülbírálás",
+              "away": "Távollét"
+            }
+          }
+        }
+      }
+    }
+  },
   "options": {
     "step": {
       "init": {
+        "title": "myVAILLANT beállítások",
         "data": {
+          "update_interval": "Élő adatok frissítési időköze (másodperc)",
+          "update_interval_daily": "Energiaelőzmények frissítési időköze (másodperc)",
+          "refresh_delay": "Módosítás utáni frissítés késleltetése (másodperc)",
+          "quick_veto_duration": "Ideiglenes felülbírálás alapértelmezett időtartama (óra)",
+          "holiday_duration": "Távollét alapértelmezett időtartama (nap)",
+          "time_program_overwrite": "A hőmérséklet-állítás az időprogramot módosítsa ideiglenes felülbírálás helyett",
+          "default_holiday_setpoint": "Távollét alapértelmezett célhőmérséklete (°C)",
+          "manual_cooling_duration": "Kézi hűtés alapértelmezett időtartama (nap)",
+          "dhw_legionella_protection_temperature": "Legionella-védelem jelzési küszöbe (°C)",
+          "country": "Ország",
+          "brand": "Márka",
+          "fetch_rts": "Valós idejű statisztikák lekérése",
+          "fetch_mpc": "Valós idejű teljesítményadatok lekérése",
+          "fetch_connection_status": "Rendszerkapcsolat állapotának külön lekérése",
+          "fetch_dtc": "Diagnosztikai hibakódok lekérése",
+          "fetch_ambisense_capability": "Az ambiSENSE támogatottságának lekérése",
+          "fetch_ambisense_rooms": "ambiSENSE szobatermosztátok lekérése",
+          "fetch_energy_management": "Energiagazdálkodási adatok lekérése",
+          "fetch_eebus": "EEBUS-adatok lekérése",
           "fetch_energy_history": "Energiaelőzmények lekérése (induláskor és újratöltéskor is)"
         },
         "data_description": {
-          "fetch_energy_history": "Kikapcsolva egyáltalán nem kéri le a korábbi fogyasztási adatokat, induláskor sem. Az élő kazánadatok és a vezérlés megmaradnak. Módosításakor ez a fiók automatikusan újratöltődik. Alapértelmezés: kikapcsolva."
+          "update_interval": "A rövidebb időköz több API-kérést okoz, és kvótahibához vagy átmeneti korlátozáshoz vezethet.",
+          "fetch_energy_history": "Alapértelmezetten kikapcsolva. Ilyenkor nem kéri le a korábbi fogyasztási adatokat sem induláskor, sem újratöltéskor, sem időzítve. Az élő kazánadatok és a vezérlés megmaradnak. A jelölőnégyzet módosítása csak ezt a fiókot tölti újra.",
+          "update_interval_daily": "Csak bekapcsolt energiaelőzményeknél érvényes. A rövidebb időköz növeli az API-forgalmat és a kvótahiba kockázatát. Üresen hagyva nincs rendszeres energiafrissítés; ez önmagában az induláskori lekérést még nem kapcsolja ki.",
+          "fetch_rts": "Nem minden rendszer támogatja. Az energiaelőzmények lekérésétől független beállítás.",
+          "fetch_mpc": "Nem minden rendszer támogatja. Az energiaelőzmények lekérésétől független beállítás.",
+          "fetch_connection_status": "Külön API-kérést használ. A Gateway Online érzékelőhöz nem szükséges bekapcsolni.",
+          "dhw_legionella_protection_temperature": "Ez diagnosztikai jelzési küszöb, nem a kazán fertőtlenítési programjának beállítása."
         }
       }
     }
