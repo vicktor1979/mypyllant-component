@@ -50,6 +50,7 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
+    Platform.BUTTON,
     Platform.CALENDAR,
     Platform.CLIMATE,
     Platform.DATETIME,
@@ -60,7 +61,7 @@ PLATFORMS: list[Platform] = [
 ]
 
 
-DIAGNOSTIC_PLATFORMS: list[Platform] = [Platform.SENSOR]
+DIAGNOSTIC_PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BUTTON]
 
 
 def _quota_reload_stagger(entry_id: str) -> int:
