@@ -26,7 +26,6 @@ from myPyllant.const import (
     DEFAULT_HOLIDAY_DURATION,
 )
 from .const import OPTION_UPDATE_INTERVAL_DAILY
-from .api_queue import get_api_refresh_queue
 
 from .const import (
     DEFAULT_FETCH_ENERGY_HISTORY,
@@ -188,11 +187,8 @@ OPTIONS_SCHEMA = vol.Schema(
 
 
 async def validate_input(hass: HomeAssistant, data: dict) -> str:
-    # Validation/reconfiguration must not log in in parallel with a poll.
-    queue = get_api_refresh_queue(hass)
-    async with queue.slot(data["username"].lower(), "myVAILLANT login validation"):
-        async with MyPyllantAPI(**data):
-            return data["username"].lower()
+    async with MyPyllantAPI(**data):
+        return data["username"].lower()
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):

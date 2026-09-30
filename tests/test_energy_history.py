@@ -8,7 +8,6 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
 from custom_components.mypyllant import async_setup_entry, SystemCoordinator
-from custom_components.mypyllant.api_queue import get_api_refresh_queue
 from custom_components.mypyllant.const import DOMAIN, OPTION_FETCH_ENERGY_HISTORY
 from custom_components.mypyllant.quota import (
     QuotaBackoffStore, async_migrate_energy_quota, is_energy_quota_exception,
@@ -78,15 +77,6 @@ async def test_energy_off_skips_startup_coordinator(hass):
     assert hass.data[DOMAIN][entry.entry_id]["energy_history_enabled"] is False
 
 
-async def test_queue_is_shared_and_reentrant(hass):
-    queue = get_api_refresh_queue(hass)
-    assert queue is get_api_refresh_queue(hass)
-    async with queue.slot("one", "setup"):
-        async with queue.slot("one", "system refresh"):
-            assert queue.status("one")["active"]
-    assert not queue.status("one")["active"]
-
-
 async def test_disabled_daily_coordinator_makes_no_api_calls(hass):
     from custom_components.mypyllant.coordinator import DailyDataCoordinator
 
@@ -98,3 +88,38 @@ async def test_disabled_daily_coordinator_makes_no_api_calls(hass):
     coordinator = DailyDataCoordinator(hass, api, entry, timedelta(hours=3))
     assert await coordinator._async_update_data() == {}
     assert not api.mock_calls
+
+
+async def test_slow_account_does_not_block_another_setup(hass):
+    """There must not be a global account queue in normal config-entry setup."""
+    import asyncio
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entries = [MockConfigEntry(
+        domain=DOMAIN,
+        title=f"account-{i}@example.invalid",
+        data={"username": f"account-{i}@example.invalid", "password": "test"},
+        options={OPTION_FETCH_ENERGY_HISTORY: False},
+    ) for i in range(2)]
+    for entry in entries:
+        entry.add_to_hass(hass)
+    barrier = asyncio.Barrier(2)
+
+    def api_factory(**kwargs):
+        api = MagicMock()
+        api.login = AsyncMock(side_effect=barrier.wait)
+        api.aiohttp_session.close = AsyncMock()
+        return api
+
+    async def initial(coordinator):
+        coordinator.data = [MagicMock()]
+
+    with (
+        patch("custom_components.mypyllant.MyPyllantAPI", side_effect=api_factory),
+        patch.object(SystemCoordinator, "async_config_entry_first_refresh", initial),
+        patch.object(hass.config_entries, "async_forward_entry_setups", new=AsyncMock()),
+    ):
+        assert await asyncio.wait_for(asyncio.gather(*(
+            async_setup_entry(hass, entry) for entry in entries
+        )), 2) == [True, True]
+    assert "mypyllant_api_refresh_queue" not in hass.data

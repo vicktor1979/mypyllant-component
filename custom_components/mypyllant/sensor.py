@@ -58,7 +58,6 @@ from .const import (
     API_DOWN_PAUSE_INTERVAL, DOMAIN,
     OPTION_FETCH_ENERGY_HISTORY, DEFAULT_FETCH_ENERGY_HISTORY,
 )
-from .api_queue import get_api_refresh_queue
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -574,10 +573,6 @@ class VaillantApiStatusSensor(SensorEntity):
         energy_store = entry_data.get("energy_quota_backoff")
         energy_state = energy_store.state if energy_store is not None else None
         energy_active = bool(energy_store is not None and energy_store.is_active)
-        queue_state = (
-            get_api_refresh_queue(self.hass).status(self.config.entry_id)
-            if self.hass is not None else {"waiting": False, "active": False}
-        )
         return {
             "Fiók": self.config.title,
             "Energiaelőzmények lekérése": self.config.options.get(
@@ -591,8 +586,6 @@ class VaillantApiStatusSensor(SensorEntity):
             "Energiaelőzmények hibája": (
                 energy_state.get("message") if energy_active and energy_state else None
             ),
-            "API-frissítés sorban áll": queue_state["waiting"],
-            "API-frissítés folyamatban": queue_state["active"],
             "HTTP állapot": http_status,
             "Hiba oka": reason,
             "Nyers hibaüzenet": original_error,

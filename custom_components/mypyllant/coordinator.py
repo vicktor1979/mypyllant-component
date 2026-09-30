@@ -39,7 +39,6 @@ from custom_components.mypyllant.const import (
     DEFAULT_FETCH_DTC,
 )
 from custom_components.mypyllant.quota import QuotaBackoffStore, is_energy_quota_exception
-from .api_queue import serialized_refresh
 from custom_components.mypyllant.utils import (
     is_quota_exceeded_exception,
     extract_quota_duration,
@@ -74,10 +73,6 @@ class MyPyllantCoordinator(DataUpdateCoordinator):
             name="myVAILLANT",
             update_interval=update_interval,
         )
-
-    def _skip_network_refresh(self) -> bool:
-        """Subclasses can skip network work before joining the shared queue."""
-        return False
 
     @property
     def hass_data(self):
@@ -428,7 +423,6 @@ class SystemCoordinator(MyPyllantCoordinator):
             "home_state_last_refreshed": self.homes_last_refresh,
         }
 
-    @serialized_refresh
     async def _async_update_data(self) -> list[System]:  # type: ignore
         await self._raise_if_persistent_quota_hit()
         self._raise_if_quota_hit()
@@ -709,18 +703,16 @@ class DailyDataCoordinator(MyPyllantCoordinator):
             self.hass, delay, retry
         )
 
-    @serialized_refresh
     async def _async_update_data(self) -> dict[str, SystemWithDeviceData]:
-        # A confirmed empty account has no daily data to fetch.  Return locally
-        # before token refresh/API access so an unused account cannot consume
-        # quota merely because Home Assistant reloads or refreshes it.
+        # The history opt-out must also protect direct/manual refresh calls,
+        # not only setup. It is independent of other accounts' refreshes.
+        if self._skip_network_refresh():
+            _LOGGER.debug("Energy history disabled or account empty, skipping daily data API fetch")
+            return {}
+
         system_coordinator: SystemCoordinator | None = self.hass_data.get(
             "system_coordinator"
         )
-        if system_coordinator is not None and system_coordinator.empty_account:
-            _LOGGER.debug("Empty myVAILLANT account, skipping daily data API fetch")
-            return {}
-
         await self._raise_if_persistent_quota_hit()
         self._raise_if_quota_hit()
         _LOGGER.debug("Starting async update data for DailyDataCoordinator")

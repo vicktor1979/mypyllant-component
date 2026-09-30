@@ -46,7 +46,6 @@ from .const import (
 )
 from .coordinator import SystemCoordinator, DailyDataCoordinator
 from .quota import QuotaBackoffStore, async_migrate_energy_quota
-from .api_queue import get_api_refresh_queue
 from .utils import is_quota_exceeded_exception
 
 _LOGGER = logging.getLogger(__name__)
@@ -195,103 +194,96 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if quota_backoff.is_active:
         return await _async_setup_quota_diagnostics(hass, entry, quota_backoff)
 
-    # One batch covers login and initial system/history fetches. Nested
-    # coordinator refreshes use the same task-reentrant queue slot.
-    queue = get_api_refresh_queue(hass)
-    async with queue.slot(entry.entry_id, f"{entry.title}: initial setup"):
-        _LOGGER.debug("Creating API and logging in with %s in realm %s", username, country)
-        api = MyPyllantAPI(
-            username=username, password=password, brand=brand, country=country
+    _LOGGER.debug("Creating API and logging in with %s in realm %s", username, country)
+    api = MyPyllantAPI(
+        username=username, password=password, brand=brand, country=country
+    )
+    try:
+        await api.login()
+    except (AuthenticationFailed, LoginEndpointInvalid, RealmInvalid) as e:
+        await api.aiohttp_session.close()
+        raise ConfigEntryAuthFailed from e
+    except ClientResponseError as e:
+        if is_quota_exceeded_exception(e):
+            await quota_backoff.async_set_from_exception(e)
+            await api.aiohttp_session.close()
+            return await _async_setup_quota_diagnostics(
+                hass, entry, quota_backoff
+            )
+        await api.aiohttp_session.close()
+        raise ConfigEntryNotReady(
+            f"Temporary myVAILLANT HTTP error during login: {e}"
+        ) from e
+    except (ClientError, TimeoutError, OSError) as e:
+        # Treat temporary login/network failures as a setup retry instead of a
+        # permanent failed setup.  This is especially important when several
+        # myVAILLANT config entries start at the same time after a HA restart.
+        await api.aiohttp_session.close()
+        raise ConfigEntryNotReady(
+            f"Temporary myVAILLANT login/network error: {e}"
+        ) from e
+    except BaseException:
+        await api.aiohttp_session.close()
+        raise
+
+    system_coordinator = SystemCoordinator(
+        hass, api, entry, timedelta(seconds=update_interval)
+    )
+    _LOGGER.debug("Refreshing SystemCoordinator")
+    try:
+        # async_refresh() only records a failed first refresh and then setup
+        # continues, which can leave entity-registry entries as "not
+        # provided" until the user manually reloads the config entry.  The
+        # config-entry first-refresh helper raises ConfigEntryNotReady on a
+        # complete initial fetch failure, so Home Assistant retries setup
+        # automatically once the Vaillant API/gateway recovers.
+        await system_coordinator.async_config_entry_first_refresh()
+    except ConfigEntryNotReady:
+        await api.aiohttp_session.close()
+        if quota_backoff.is_active:
+            return await _async_setup_quota_diagnostics(
+                hass, entry, quota_backoff
+            )
+        raise
+    except BaseException:
+        await api.aiohttp_session.close()
+        raise
+    hass.data[DOMAIN][entry.entry_id]["system_coordinator"] = system_coordinator
+
+    # Keep empty accounts diagnostic-only. History is opt-in: when disabled,
+    # do not even construct the daily coordinator, including on entry reload.
+    # The live coordinator retains its own configured polling interval.
+    if system_coordinator.empty_account:
+        _LOGGER.info(
+            "myVAILLANT account %s contains no homes; disabling polling until "
+            "the config entry is reloaded",
+            username,
         )
+        system_coordinator.update_interval = None
+        loaded_platforms = DIAGNOSTIC_PLATFORMS
+    elif not energy_enabled:
+        _LOGGER.info(
+            "Energy history disabled for %s: no startup, reload or periodic buckets requests",
+            entry.title,
+        )
+        loaded_platforms = PLATFORMS
+    else:
+        daily_data_coordinator = DailyDataCoordinator(
+            hass,
+            api,
+            entry,
+            timedelta(seconds=update_interval_daily) if update_interval_daily else None,
+        )
+        hass.data[DOMAIN][entry.entry_id][
+            "daily_data_coordinator"
+        ] = daily_data_coordinator
+        _LOGGER.debug("Refreshing DailyDataCoordinator")
         try:
-            await api.login()
-        except (AuthenticationFailed, LoginEndpointInvalid, RealmInvalid) as e:
-            await api.aiohttp_session.close()
-            raise ConfigEntryAuthFailed from e
-        except ClientResponseError as e:
-            if is_quota_exceeded_exception(e):
-                await quota_backoff.async_set_from_exception(e)
-                await api.aiohttp_session.close()
-                return await _async_setup_quota_diagnostics(
-                    hass, entry, quota_backoff
-                )
-            await api.aiohttp_session.close()
-            raise ConfigEntryNotReady(
-                f"Temporary myVAILLANT HTTP error during login: {e}"
-            ) from e
-        except (ClientError, TimeoutError, OSError) as e:
-            # Treat temporary login/network failures as a setup retry instead of a
-            # permanent failed setup.  This is especially important when several
-            # myVAILLANT config entries start at the same time after a HA restart.
-            await api.aiohttp_session.close()
-            raise ConfigEntryNotReady(
-                f"Temporary myVAILLANT login/network error: {e}"
-            ) from e
+            await daily_data_coordinator.async_refresh()
         except BaseException:
             await api.aiohttp_session.close()
             raise
-
-        system_coordinator = SystemCoordinator(
-            hass, api, entry, timedelta(seconds=update_interval)
-        )
-        _LOGGER.debug("Refreshing SystemCoordinator")
-        try:
-            # async_refresh() only records a failed first refresh and then setup
-            # continues, which can leave entity-registry entries as "not
-            # provided" until the user manually reloads the config entry.  The
-            # config-entry first-refresh helper raises ConfigEntryNotReady on a
-            # complete initial fetch failure, so Home Assistant retries setup
-            # automatically once the Vaillant API/gateway recovers.
-            await system_coordinator.async_config_entry_first_refresh()
-        except ConfigEntryNotReady:
-            await api.aiohttp_session.close()
-            if quota_backoff.is_active:
-                return await _async_setup_quota_diagnostics(
-                    hass, entry, quota_backoff
-                )
-            raise
-        except BaseException:
-            await api.aiohttp_session.close()
-            raise
-        hass.data[DOMAIN][entry.entry_id]["system_coordinator"] = system_coordinator
-
-        # Daily data coordinator is fetched once by default (to get all entities), but
-        # not updated on a regular basis
-        # to prevent quota errors.  A successfully authenticated account with no
-        # homes is valid; do not make any more API calls for it after the initial
-        # /homes check.  With no entities there are no coordinator listeners, and
-        # explicitly disabling the interval also prevents accidental future polls.
-        if system_coordinator.empty_account:
-            _LOGGER.info(
-                "myVAILLANT account %s contains no homes; disabling polling until "
-                "the config entry is reloaded",
-                username,
-            )
-            system_coordinator.update_interval = None
-            loaded_platforms = DIAGNOSTIC_PLATFORMS
-        elif not energy_enabled:
-            _LOGGER.info(
-                "Energy history disabled for %s: no startup, reload or periodic buckets requests",
-                entry.title,
-            )
-            loaded_platforms = PLATFORMS
-        else:
-            daily_data_coordinator = DailyDataCoordinator(
-                hass,
-                api,
-                entry,
-                timedelta(seconds=update_interval_daily) if update_interval_daily else None,
-            )
-            hass.data[DOMAIN][entry.entry_id][
-                "daily_data_coordinator"
-            ] = daily_data_coordinator
-            _LOGGER.debug("Refreshing DailyDataCoordinator")
-            try:
-                await daily_data_coordinator.async_refresh()
-            except BaseException:
-                await api.aiohttp_session.close()
-                raise
-            loaded_platforms = PLATFORMS
+        loaded_platforms = PLATFORMS
 
     hass.data[DOMAIN][entry.entry_id]["loaded_platforms"] = loaded_platforms
     await hass.config_entries.async_forward_entry_setups(entry, loaded_platforms)
